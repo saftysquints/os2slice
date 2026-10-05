@@ -15,14 +15,26 @@ from os2slice.auth import Keys
 from os2slice.bambuddy import BambuddyClient, BambuddyError
 from os2slice.modules import registry
 from os2slice.modules.bambuddy import BambuddyModule, pool_material_id
-from os2slice.modules.base import Material, PartGeometry, SliceOutput
+from os2slice.modules.base import Material, ModelDefaults, ModuleError, PartGeometry, SliceOutput
 from os2slice.onshape import OnshapeClient
 from os2slice.orientation import Orientation
 from os2slice.settings import PrintSettings
 from tests.conftest import DOC, ELEM, WS, make_stl
-from tests.fakes import PRINTERS, FakeBambuddy, dual_nozzle_3mf, fake_onshape, uploaded_zip
-from tests.test_modules import job_for, module
-from tests.test_printing import mods, onshape, req  # noqa: F401  (onshape is a fixture)
+from tests.fakes import (
+    FILAMENT_PRESETS,
+    PRINTERS,
+    FakeBambuddy,
+    dual_nozzle_3mf,
+    fake_onshape,
+    uploaded_zip,
+)
+from tests.test_modules import H2D, job_for, module
+from tests.test_printing import (  # noqa: F401  (onshape is a fixture)
+    mods,
+    onshape,
+    req,
+    with_models,
+)
 from tests.test_server import Running, choices, panel_form, wait_job
 
 URL = f"https://cad.onshape.com/documents/{DOC}/w/{WS}/e/{ELEM}"
@@ -112,12 +124,14 @@ def test_pool_status_with_a_member_down_and_all_down() -> None:
     assert (st.state, st.connected, st.ready) == ("offline", False, False)
 
 
-def test_dual_nozzle_pool_materials_are_usable_without_a_nozzle() -> None:
+def test_dual_nozzle_pool_materials_carry_the_nozzle_that_feeds_them() -> None:
     m = module(FakeBambuddy())
     h2d = pool(m, "H2D")
-    st = m.status(h2d)
-    red = next(x for x in st.materials if x.id == "PLA.FF0000")
-    assert red.extruder is None and printing.usable(red, h2d)
+    by_id = {x.id: x for x in m.status(h2d).materials}
+    red, white = by_id["PLA.FF0000"], by_id["PLA.FFFFFF"]  # AMS 2 → right, AMS 1 → left
+    assert (red.extruder, white.extruder) == (0, 1)
+    assert red.label == "PLA · red · right nozzle (loaded)" and printing.usable(red, h2d)
+    assert by_id["PLA.000000"].extruder == 1 and by_id["PLA.0000FF"].extruder == 0  # Ext-L/R
 
 
 def test_pool_material_id_fits_the_forms() -> None:
@@ -192,8 +206,9 @@ def test_queue_print_needs_exactly_one_destination() -> None:
     assert fake.queued == []
 
 
-def test_dual_nozzle_pool_slices_without_pinning_or_the_nozzle_check() -> None:
-    # The sliced file prints on the left nozzle; a pinned right-nozzle slot would refuse it.
+def test_dual_nozzle_pool_filament_without_a_nozzle_slices_unpinned() -> None:
+    # No nozzle known (a bare preset, an unmapped AMS): no Manual map and no nozzle check;
+    # the sliced file prints on the left nozzle and that's accepted.
     fake = FakeBambuddy(job_states=["completed"], sliced_3mf=dual_nozzle_3mf())
     m = module(fake)
     red = Material("PLA.FF0000", "PLA · red", "PLA", "#FF0000", profile="Generic PLA @BBL H2D")
@@ -381,3 +396,194 @@ def test_loaded_note_counts_slots_and_printers_separately() -> None:
     assert _loaded_note(1, 1, 2) == " (loaded on 1 of 2 printers)"
     assert _loaded_note(3, 2, 2) == " (loaded in 3 slots on 2 of 2 printers)"
     assert _loaded_note(2, 2, 3) == " (loaded on 2 of 3 printers)"
+
+
+# -- dual-nozzle pools: the nozzle each filament is pinned to (D-35) --------------------
+
+BLUE_ASA = {"id": 0, "tray_type": "ASA", "tray_color": "2140B4FF", "exists": True, "remain": 0}
+
+
+def h2d_farm(fake: FakeBambuddy, statuses: dict[int, dict[str, Any]]) -> Any:
+    """A handler: the fake with more H2Ds ("H2D_<id>"), each with its own status filament."""
+    extra = [
+        {"id": pid, "name": f"H2D_{pid:02d}", "model": "H2D", "is_active": True,
+         "nozzle_count": 2}
+        for pid in statuses
+    ]  # fmt: skip
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v1/printers/":
+            fake.requests.append(request)
+            return httpx.Response(200, json=[*PRINTERS, *extra])
+        for pid, body in statuses.items():
+            if path == f"/api/v1/printers/{pid}/status":
+                fake.requests.append(request)
+                return httpx.Response(
+                    200, json={"id": pid, "connected": True, "state": fake.status, **body}
+                )
+        return fake(request)
+
+    return handler
+
+
+def ams0(tray: dict[str, Any], side: int | None) -> dict[str, Any]:
+    """One AMS (unit 0) holding `tray`, feeding nozzle `side` (None: not in the map)."""
+    return {
+        "ams_extruder_map": {} if side is None else {"0": side},
+        "ams": [{"id": 0, "tray": [tray]}],
+        "vt_tray": [],
+    }
+
+
+def red(side: int | None) -> dict[str, Any]:
+    tray = {"id": 0, "tray_type": "PLA", "tray_color": "FF0000FF", "exists": True, "remain": 0}
+    return ams0(tray, side)
+
+
+def test_pool_colour_only_on_a_left_fed_ams_is_pinned_left_through_the_print(
+    cfg: config.Config,
+    onshape: OnshapeClient,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failed print (queue item 9): blue ASA only on H2D_04's AMS 1, which feeds
+    the left nozzle. The pool material says left, the 3MF pins it there, and it's queued."""
+    from tests import fakes
+
+    monkeypatch.setattr(fakes, "FILAMENT_PRESETS", [*FILAMENT_PRESETS, "Generic ASA @BBL H2D"])
+    c = with_models(cfg, H2D=ModelDefaults(profiles=H2D))
+    fake = FakeBambuddy(job_states=["completed"], sliced_3mf=dual_nozzle_3mf(kind="ASA"))
+    statuses = {4: {**ams0(BLUE_ASA, 1), "ams_extruder_map": {"0": 1, "1": 0}}}
+    m = mods(c, h2d_farm(fake, statuses))
+    p = printing.plan_print(req(), c, onshape, m, "Any H2D", Orientation.parse("z+"),
+                            PrintSettings(), "ASA.2140B4")  # fmt: skip
+    assert p.material is not None and p.material.extruder == 1
+    assert p.material.label == "ASA · blue · left nozzle (loaded on 1 of 2 printers)"
+    printing.execute_print(p, c, onshape, m, queue=True)
+    ms = uploaded_zip(fake).read("Metadata/model_settings.config").decode()
+    assert 'filament_maps" value="1"' in ms and "Manual" in ms  # pinned to the left nozzle
+    (item,) = fake.queued
+    assert item["target_model"] == "H2D" and item["filament_overrides"][0]["color"] == "#2140B4"
+    # Sliced onto the right nozzle after all: refused after slicing, like one printer.
+    fake.sliced_3mf = dual_nozzle_3mf(extruder_id=2, kind="ASA")
+    with pytest.raises(BambuddyError, match="prints on the right nozzle"):
+        printing.execute_print(p, c, onshape, m, queue=True)
+    assert len(fake.queued) == 1
+
+
+def test_pool_nozzle_is_the_one_on_most_printers() -> None:
+    fake = FakeBambuddy()
+    m = module(fake)
+    # H2D_01 (the fake) has red on the right; two more have it on the left.
+    m._transport = httpx.MockTransport(h2d_farm(fake, {4: red(1), 6: red(1)}))
+    st = m.status(pool(m, "H2D"))
+    r = next(x for x in st.materials if x.id == "PLA.FF0000")
+    assert r.extruder == 1
+    assert r.label == "PLA · red · left nozzle on 2, right on 1 (loaded on 3 of 3 printers)"
+    # A tie (one each side) goes to the right (main) nozzle.
+    m._transport = httpx.MockTransport(h2d_farm(fake, {4: red(1)}))
+    r = next(x for x in m.status(pool(m, "H2D")).materials if x.id == "PLA.FF0000")
+    assert r.extruder == 0 and "right nozzle on 1, left on 1" in r.label
+
+
+def test_pool_nozzle_unknown_stays_none() -> None:
+    fake = FakeBambuddy()
+    m = module(fake)
+    m._transport = httpx.MockTransport(
+        h2d_farm(fake, {4: ams0(BLUE_ASA, None)})
+    )  # AMS 0 not in the map
+    h2d = pool(m, "H2D")
+    asa = next(x for x in m.status(h2d).materials if x.id == "ASA.2140B4")
+    assert asa.extruder is None and "nozzle" not in asa.label
+    # Another member that knows decides; the unknown one doesn't count.
+    m._transport = httpx.MockTransport(
+        h2d_farm(fake, {4: ams0(BLUE_ASA, None), 6: ams0(BLUE_ASA, 1)})
+    )
+    asa = next(x for x in m.status(pool(m, "H2D")).materials if x.id == "ASA.2140B4")
+    assert asa.extruder == 1 and asa.label.endswith("· left nozzle (loaded on 2 of 3 printers)")
+
+
+def test_single_nozzle_pool_materials_have_no_nozzle() -> None:
+    fake = FakeBambuddy()
+    m = module(fake)
+    m._transport = two_a1_minis(fake)
+    st = m.status(pool(m, "A1 Mini"))
+    assert all(x.extruder is None and "nozzle" not in x.label for x in st.materials)
+
+
+# -- the pre-queue check on dual-nozzle pools ------------------------------------------
+
+RED = Material("PLA.FF0000", "PLA · red", "PLA", "#FF0000", extruder=0, raw={"type": "PLA"})
+
+
+def sliced_on(m: BambuddyModule, data: bytes) -> SliceOutput:
+    return dataclasses.replace(sliced(m), data=data)
+
+
+def status_calls(fake: FakeBambuddy) -> int:
+    return sum(1 for r in fake.requests if r.url.path.endswith("/status"))
+
+
+def test_pool_refuses_a_colour_no_member_has_on_the_sliced_nozzle() -> None:
+    fake = FakeBambuddy()
+    m = module(fake)
+    h2d = pool(m, "H2D")
+    left = sliced_on(m, dual_nozzle_3mf())  # H2D_01 has red only on the right
+    with pytest.raises(ModuleError, match="No H2D has PLA red on the left nozzle") as e:
+        m.submit(h2d, left, start=True, materials=(RED,))
+    assert "AMS feeding the nozzle" in e.value.fix
+    assert fake.queued == [] and fake.uploads == []
+    m.submit(h2d, sliced_on(m, dual_nozzle_3mf(extruder_id=2)), start=True, materials=(RED,))
+    assert fake.queued[0]["filament_overrides"][0]["color"] == "#FF0000"
+
+
+def test_pool_check_needs_one_member_with_it_on_that_side() -> None:
+    fake = FakeBambuddy()
+    m = module(fake)
+    m._transport = httpx.MockTransport(
+        h2d_farm(fake, {4: red(1)})
+    )  # H2D_04 has red on the left: it can take it
+    m.submit(pool(m, "H2D"), sliced_on(m, dual_nozzle_3mf()), start=True, materials=(RED,))
+    assert len(fake.queued) == 1
+
+
+def test_pool_check_for_a_preset_uses_the_files_type() -> None:
+    fake = FakeBambuddy()
+    m = module(fake)
+    h2d = pool(m, "H2D")
+    preset = printing.preset_material("Generic ASA @BBL H2D")
+    with pytest.raises(ModuleError, match=r"ASA \(any colour\) on the left nozzle"):
+        m.submit(h2d, sliced_on(m, dual_nozzle_3mf(kind="ASA")), start=True, materials=(preset,))
+    # PLA on the left: H2D_01 has white PLA in AMS 1, which feeds the left nozzle.
+    m.submit(h2d, sliced_on(m, dual_nozzle_3mf()), start=True, materials=(preset,))
+    m.submit(h2d, sliced_on(m, dual_nozzle_3mf()), start=True)  # the printer's preset
+    assert len(fake.queued) == 2 and "filament_overrides" not in fake.queued[0]
+
+
+def test_pool_check_with_a_filament_switch_or_no_printer_answering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests import fakes
+
+    fake = FakeBambuddy()
+    m = module(fake)
+    h2d = pool(m, "H2D")
+    left = sliced_on(m, dual_nozzle_3mf())
+    monkeypatch.setitem(fakes.STATUS_FILAMENT[3], "fila_switch", {"installed": True})
+    m.submit(h2d, left, start=True, materials=(RED,))  # an FTS feeds either nozzle
+    assert len(fake.queued) == 1
+    m._transport = httpx.MockTransport(
+        lambda r: httpx.Response(500) if r.url.path.endswith("/status") else fake(r)
+    )
+    with pytest.raises(ModuleError, match="no printer answered"):
+        m.submit(h2d, left, start=True, materials=(RED,))
+    assert len(fake.queued) == 1
+
+
+def test_pool_check_skipped_without_a_nozzle_in_the_file_and_on_single_nozzle_pools() -> None:
+    fake = FakeBambuddy()
+    m = module(fake)
+    m.submit(pool(m, "H2D"), sliced(m), start=True, materials=(RED,))  # b"PK": no nozzle info
+    a1 = Material("PETG.000000", "PETG · black", "PETG", "#000000", raw={"type": "PETG"})
+    m.submit(pool(m, "A1 Mini"), sliced_on(m, dual_nozzle_3mf()), start=True, materials=(a1,))
+    assert len(fake.queued) == 2 and status_calls(fake) == 0

@@ -201,8 +201,9 @@ def layout(job: SliceInput, *, tower: tuple[float, float] | None = None) -> Proj
         for p, stl in zip(job.parts, placed, strict=True)
     ]
     dual = job.printer.nozzle_count > 1
-    # A printer pool's materials have no nozzle (the printer isn't known yet): no
-    # Manual filament map then, the slicer chooses.
+    # Only when every filament has a nozzle: a pool's loaded filaments carry the one that
+    # feeds them on most of its printers (D-35), but a bare preset, or a slot whose AMS
+    # isn't in ams_extruder_map, has none. No Manual filament map then, the slicer chooses.
     pinned = dual and bool(filaments) and all(m.extruder is not None for m in filaments)
     maps = [1 if m.extruder == 1 else 2 for m in filaments] if pinned else None
     ox0, oy0 = min(o[0] for o in offsets), min(o[1] for o in offsets)

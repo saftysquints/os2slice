@@ -1269,8 +1269,8 @@ def _printer_choice(printer: str, filament: str, tool: str = "") -> tuple[str, s
 
 
 def _material_label(m: Material, printer: PrinterInfo) -> tuple[str, bool]:
-    """(menu label, disabled) for a loaded material. A pool's materials have no nozzle
-    (BamBuddy picks the printer, and so the trays, at dispatch): they stay usable."""
+    """(menu label, disabled) for a loaded material. A pool's materials without a nozzle
+    (BamBuddy picks the printer, and so the trays, at dispatch; D-35) stay usable."""
     if printer.nozzle_count > 1 and m.extruder is None and not printer.pool:
         return f"{m.label} (nozzle unknown)", True
     if m.raw.get("empty"):
