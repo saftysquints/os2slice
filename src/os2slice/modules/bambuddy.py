@@ -7,7 +7,9 @@ second upload. Shapes are in docs/BAMBUDDY_API.md; decisions D-14, D-19, D-20, D
 
 As a target it also offers one pool per model, "Any <model>": the queue item names the
 model instead of a printer, and BamBuddy's scheduler dispatches it to the first idle
-printer of that model with the chosen filaments (type and colour) loaded.
+printer of that model with the chosen filaments (type and colour) loaded. On a
+dual-nozzle model each pool filament is pinned to the nozzle that feeds it on most of
+the model's printers, and a job no printer can take on those nozzles isn't queued (D-35).
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from os2slice.filaments import (
     match_preset,
     preset_suffix,
     sliced_nozzle,
+    sliced_type,
     slots_from_status,
 )
 from os2slice.modules.bambu_project import BED_MM, Project, layout, with_tower_retries
@@ -229,9 +232,10 @@ class BambuddyModule:
             log.info("sliced %s → library file %s", name, sliced.library_file_id)
             data = bb.download_file(sliced.library_file_id)
         if dual and filaments and all(m.extruder is not None for m in filaments):
-            # Every filament must print on the nozzle its slot feeds. Skipped for a pool
-            # ("Any H2D"): its materials have no tray and so no nozzle; BamBuddy maps the
-            # trays of the printer it picks at dispatch.
+            # Every filament must print on the nozzle its slot feeds. A pool's ("Any H2D")
+            # filaments carry the nozzle that feeds them on most of its printers (D-35);
+            # skipped when one has none (a bare preset, or no member says): the slicer
+            # picks the nozzle then, and submit() checks a member can take it.
             for n, m in enumerate(filaments, start=1):
                 got = sliced_nozzle(data, n)
                 if got != m.extruder:
@@ -390,12 +394,16 @@ class BambuddyModule:
     def _pool_status(self, printer: PrinterInfo) -> PrinterStatus:
         """A pool's status: ready when any member is; its materials are the distinct
         (type, colour) pairs loaded across the members, what BamBuddy's scheduler can
-        match a job against (docs/BAMBUDDY_API.md). No nozzles: the printer isn't known.
+        match a job against (docs/BAMBUDDY_API.md). On a dual-nozzle model each one
+        carries the nozzle that feeds it on most members (`_pool_nozzle`, D-35), so the
+        slice is pinned to it like a single printer's (D-20).
         """
         members = [int(i) for i in printer.extra.get("members") or ()]
         suffix = preset_suffix(printer.profiles.filament)
+        dual = printer.nozzle_count > 1
         states: list[PrinterStatus] = []
-        found: dict[tuple[str, str], tuple[Slot, list[int]]] = {}
+        # (type, colour) → (first slot seen, member per slot, member → nozzles feeding it)
+        found: dict[tuple[str, str], tuple[Slot, list[int], dict[int, set[int]]]] = {}
         names: list[str] = []
         try:
             with self.client() as bb:
@@ -411,10 +419,13 @@ class BambuddyModule:
                         states.append(PrinterStatus("offline", False, False, e.message))
                         continue
                     states.append(_status_of(raw, ()))
-                    for slot in slots_from_status(raw):
+                    for slot in slots_from_status(raw, dual):
                         colour = slot.color.upper() if slot.color_known else ""
                         k = (slot.material.upper(), colour)
-                        found.setdefault(k, (slot, []))[1].append(pid)
+                        _, on, feeds = found.setdefault(k, (slot, [], {}))
+                        on.append(pid)
+                        if slot.extruder is not None and slot.extruder in NOZZLE_NAMES:
+                            feeds.setdefault(pid, set()).add(slot.extruder)
                 if found and suffix:
                     names = self._filament_names(bb)
         except ModuleAuthError:
@@ -425,29 +436,33 @@ class BambuddyModule:
         n = len(states)
         # A tray that reports no colour is offered as "any colour": its type only, so
         # the job isn't forced onto a made-up grey that no printer has (pool_overrides).
-        materials = tuple(
-            Material(
-                id=pool_material_id(slot.material, slot.color if slot.color_known else ""),
-                label=f"{slot.brand or slot.material} · "
-                + (color_name(slot.color) if slot.color_known else "any colour")
-                + _loaded_note(len(on), len(set(on)), n),
-                kind=slot.material,
-                colour=slot.color if slot.color_known else None,
-                profile=match_preset(slot, suffix, names) or "",
-                raw={"type": slot.material, "brand": slot.brand, "printers": tuple(on)},
+        materials = []
+        for slot, on, feeds in found.values():
+            extruder, nozzle_note = _pool_nozzle(feeds) if dual else (None, "")
+            materials.append(
+                Material(
+                    id=pool_material_id(slot.material, slot.color if slot.color_known else ""),
+                    label=f"{slot.brand or slot.material} · "
+                    + (color_name(slot.color) if slot.color_known else "any colour")
+                    + nozzle_note
+                    + _loaded_note(len(on), len(set(on)), n),
+                    kind=slot.material,
+                    colour=slot.color if slot.color_known else None,
+                    extruder=extruder,
+                    profile=match_preset(slot, suffix, names) or "",
+                    raw={"type": slot.material, "brand": slot.brand, "printers": tuple(on)},
+                )
             )
-            for slot, on in found.values()
-        )
         ready = sum(1 for st in states if st.ready)
         if not any(st.connected for st in states):
             detail = "no printer of this model answers" if n else "no active printer"
-            return PrinterStatus("offline", False, False, detail, materials)
+            return PrinterStatus("offline", False, False, detail, tuple(materials))
         return PrinterStatus(
             state="IDLE" if ready else "BUSY",
             connected=True,
             ready=ready > 0,
             detail=f"{ready} of {n} free",
-            materials=materials,
+            materials=tuple(materials),
         )
 
     def filament_presets(self, printer: PrinterInfo) -> tuple[str, ...]:
@@ -476,7 +491,9 @@ class BambuddyModule:
 
         On a pool BamBuddy picks the printer: the item names the model, and each chosen
         material becomes a forced type+colour filament override; no tray ids and no AMS
-        mapping (BamBuddy maps the trays of the printer it picks, at dispatch).
+        mapping (BamBuddy maps the trays of the printer it picks, at dispatch). On a
+        dual-nozzle model it is refused first unless a member has every filament on the
+        nozzle the file prints it with (`_check_pool_nozzles`, D-35).
         """
         if output.media != MEDIA_GCODE_3MF:
             raise ModuleError(f"BamBuddy can't print {output.media} files")
@@ -493,6 +510,8 @@ class BambuddyModule:
                 mapping, use_ams = trays, True
         report = output.report
         with self.client() as bb:
+            if printer.pool and printer.nozzle_count > 1:
+                self._check_pool_nozzles(bb, printer, output.data, materials)
             file_id = report.get("library_file_id")
             if not (report.get("module") == SPEC.kind and report.get("url") == self.url
                     and isinstance(file_id, int)):  # fmt: skip
@@ -525,6 +544,71 @@ class BambuddyModule:
             detail=f"item {item.get('id')}, {how}",
             url=self.ui_url(),
             raw=item,
+        )
+
+    def _check_pool_nozzles(
+        self,
+        bb: BambuddyClient,
+        printer: PrinterInfo,
+        data: bytes,
+        materials: tuple[Material, ...],
+    ) -> None:
+        """Refuse a dual-nozzle pool job that no member printer can take as sliced.
+
+        BamBuddy's scheduler picks a printer by filament type and colour alone, then at
+        dispatch maps each filament only to trays on the nozzle the file prints it with;
+        when that finds none the item goes out with `use_ams` and no AMS mapping and the
+        printer fails it (0700-7000-0002-0008, docs/BAMBUDDY_API.md). So: some member,
+        from its live status, must have every filament (the forced type and colour, or a
+        preset's type as the file names it) in a slot feeding that filament's nozzle. A
+        filament whose nozzle the file doesn't say isn't checked (BamBuddy doesn't filter
+        it either); a member with a filament switch (FTS) feeds either nozzle.
+        """
+        wants: list[tuple[str, str | None, int]] = []  # (type, colour or None, nozzle)
+        chosen: tuple[Material | None, ...] = materials or (None,)
+        for n, m in enumerate(chosen, start=1):
+            nozzle = sliced_nozzle(data, n)
+            if nozzle is None or nozzle not in NOZZLE_NAMES:
+                continue
+            colour = m.colour if m is not None and not m.raw.get("preset") else None
+            if m is not None and colour:
+                kind = str(m.raw.get("type") or m.kind)  # forced: pool_overrides
+            else:
+                colour = None
+                kind = sliced_type(data, n) or (m.kind if m is not None else "")
+            if kind:
+                wants.append((kind, colour, nozzle))
+        if not wants:
+            return
+        members = [int(i) for i in printer.extra.get("members") or ()]
+        answered = 0
+        for pid in members:
+            try:
+                raw = bb.printer_status(pid)
+            except ModuleAuthError:
+                raise
+            except ModuleError as e:
+                log.warning("bambuddy %s: no status for printer %s: %s", self.url, pid, e.message)
+                continue
+            answered += 1
+            if _can_take(raw, wants):
+                return
+        if not answered:
+            raise ModuleError(
+                f"Couldn't check which {printer.model} can print this: no printer answered; "
+                "not queued",
+                "Check BamBuddy and the printers, then try again",
+            )
+        need = "; ".join(
+            f"{kind} {color_name(colour) if colour else '(any colour)'} on the "
+            f"{NOZZLE_NAMES[nozzle]} nozzle"
+            for kind, colour, nozzle in wants
+        )
+        raise ModuleError(
+            f"No {printer.model} has {need}, as the file was sliced; not queued",
+            "BamBuddy only maps a filament to an AMS feeding the nozzle it was sliced for. "
+            "Load it in an AMS on that side of one of the printers, or print on a "
+            "specific printer",
         )
 
     # -- plumbing --------------------------------------------------------------
@@ -571,6 +655,56 @@ def _status_of(raw: Mapping[str, Any], materials: tuple[Material, ...]) -> Print
         materials=materials,
         raw=raw,
     )
+
+
+def _pool_nozzle(feeds: Mapping[int, set[int]]) -> tuple[int | None, str]:
+    """The nozzle a dual-nozzle pool filament is pinned to, and its label note.
+
+    `feeds` is member printer → the nozzles a slot holding the filament feeds there.
+    The nozzle that feeds it on the most printers wins (a printer with it on both
+    sides counts for both); the right (main) nozzle on a tie. None, and no note,
+    when no member says which nozzle (an AMS missing from `ams_extruder_map`).
+    """
+    counts = {n: sum(1 for nozzles in feeds.values() if n in nozzles) for n in NOZZLE_NAMES}
+    if not any(counts.values()):
+        return None, ""
+    best = max(sorted(counts), key=lambda n: counts[n])  # max keeps the first: 0 on a tie
+    note = f" · {NOZZLE_NAMES[best]} nozzle"
+    others = [n for n in sorted(counts) if n != best and counts[n]]
+    if others:
+        note += f" on {counts[best]}, " + ", ".join(
+            f"{NOZZLE_NAMES[n]} on {counts[n]}" for n in others
+        )
+    return best, note
+
+
+def _can_take(raw: Mapping[str, Any], wants: list[tuple[str, str | None, int]]) -> bool:
+    """Whether a dual-nozzle printer (its status body) has each wanted filament (type,
+    colour or None for any, nozzle) in a slot feeding that nozzle, as BamBuddy's
+    dispatch-time matcher requires (docs/BAMBUDDY_API.md)."""
+    switch = raw.get("fila_switch")
+    fts = isinstance(switch, Mapping) and bool(switch.get("installed"))
+    slots = slots_from_status(dict(raw), True)
+
+    def fits(s: Slot, kind: str, colour: str | None, nozzle: int) -> bool:
+        if _canonical_type(s.material) != _canonical_type(kind):
+            return False
+        if colour is not None and not (
+            s.color_known and s.color.upper() == f"#{colour.lstrip('#').upper()[:6]}"
+        ):
+            return False
+        return fts or s.extruder == nozzle
+
+    return all(any(fits(s, *want) for s in slots) for want in wants)
+
+
+# Types BamBuddy treats as one (v1.2.5.7 utils/filament_types.py FILAMENT_TYPE_GROUPS).
+_TYPE_GROUPS = {"PA12-CF": "PA-CF", "PAHT-CF": "PA-CF"}
+
+
+def _canonical_type(kind: str) -> str:
+    upper = kind.strip().upper()
+    return _TYPE_GROUPS.get(upper, upper)
 
 
 def _loaded_note(slots: int, printers: int, members: int) -> str:

@@ -1,6 +1,6 @@
 # Home Assistant local add-on (deployed to /local_apps/os2slice by scripts/deploy_addon.sh).
 name: os2slice
-version: "0.3.6"
+version: "0.3.7"
 slug: os2slice
 url: https://github.com/jlbimson/os2slice
 description: Print Onshape parts through BamBuddy, with orientation and settings, and a config page at /admin (LAN only)

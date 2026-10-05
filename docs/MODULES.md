@@ -114,9 +114,14 @@ slicer = "orca-api"              # any of: slicer, profiles (per field), bed_mm,
   per chosen filament with a type and colour, `slot_id` = filament n) and no
   `printer_id` or `ams_mapping`: BamBuddy's scheduler dispatches it to the first idle
   printer of that model with every filament loaded and maps its trays itself. On
-  dual-nozzle models (H2D) the pool's materials have no nozzle: they stay selectable,
-  the project gets no Manual filament map (the slicer chooses), and the check that
-  each filament prints on the nozzle its slot feeds is skipped. A
+  dual-nozzle models (H2D) each pool material's `extruder` is the nozzle that feeds it
+  on the most member printers (right on a tie; label "PLA · red · left nozzle (loaded)",
+  "· left nozzle on 2, right on 1" when they disagree), so the project is pinned and
+  checked after slicing as for one printer (D-20); a material no member can place (an
+  AMS missing from `ams_extruder_map`) or a preset has none and stays selectable, and
+  the slicer chooses then. Before queueing on a dual-nozzle pool, `submit` refuses
+  unless one member has every filament (forced type + colour, or a preset's type as the
+  sliced file names it) in a slot feeding the nozzle the file prints it with (D-35). A
   `[printers."Any <model>"]` entry overrides a pool like any discovered printer.
 - A pool's filament menu (panel and page): first the loaded (type, colour) pairs,
   labelled "PETG · black (loaded)" ("(loaded in 3 slots on 2 of 2 printers)" with several printers), each
@@ -218,7 +223,7 @@ filled-in secret option replaces its page value at each start (D-32).
    configured `materials` (`PrinterInfo.materials`). Menu values are `Material.id`
    (`[A-Za-z0-9_.-]{1,40}`); the right-click page's single menu sends `<key>|<id>`. A
    material is usable once it has a `profile` and, on a dual-nozzle printer that isn't a
-   pool, an `extruder`.
+   pool, an `extruder` (a pool's material may have one, D-35, but needn't).
 3. On Print: export + orient as today → `SliceInput` → the printer's slicer →
    `SliceOutput` → the printer's target `submit(start=not wait)`, where `wait` is the
    person's **Wait for Start** checkbox (form field `manual_start`, absent or `on`; the
