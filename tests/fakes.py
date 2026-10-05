@@ -197,7 +197,9 @@ def fake_onshape(request: httpx.Request) -> httpx.Response:
     return httpx.Response(404, json={"message": "Not found."})
 
 
-def dual_nozzle_3mf(group: int = 0, extruder_id: int = 1, physical=("1", "0")) -> bytes:
+def dual_nozzle_3mf(
+    group: int = 0, extruder_id: int = 1, physical=("1", "0"), kind: str = "PLA"
+) -> bytes:
     """A minimal sliced .gcode.3mf with BamBuddy's H2D nozzle metadata."""
     import io
     import zipfile
@@ -205,7 +207,7 @@ def dual_nozzle_3mf(group: int = 0, extruder_id: int = 1, physical=("1", "0")) -
     settings = {"physical_extruder_map": list(physical), "filament_map": ["1"]}
     info = (
         '<?xml version="1.0"?><config><plate>'
-        f'<filament id="1" group_id="{group}" type="PLA"/>'
+        f'<filament id="1" group_id="{group}" type="{kind}"/>'
         f'<nozzle id="{group}" extruder_id="{extruder_id}" nozzle_diameter="0.4"/>'
         "</plate></config>"
     )

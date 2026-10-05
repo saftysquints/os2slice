@@ -152,6 +152,21 @@ def sliced_nozzle(threemf: bytes, filament: int = 1) -> int | None:
     return None
 
 
+def sliced_type(threemf: bytes, filament: int = 1) -> str:
+    """The filament type ("ASA") a sliced .gcode.3mf names for `filament` in
+    slice_info.config, what BamBuddy's dispatcher matches trays against; "" if none."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(threemf)) as z:
+            # BamBuddy's own slicer output; expat resolves no external entities.
+            info = ElementTree.fromstring(z.read("Metadata/slice_info.config"))  # noqa: S314
+    except (KeyError, ValueError, zipfile.BadZipFile, ElementTree.ParseError):
+        return ""
+    for elem in info.iter("filament"):
+        if _int(elem.get("id")) == filament:
+            return str(elem.get("type") or "").strip()
+    return ""
+
+
 def color_name(hex_color: str) -> str:
     m = re.fullmatch(r"#?([0-9A-Fa-f]{6})", hex_color)
     if not m:
