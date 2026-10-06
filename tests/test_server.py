@@ -719,6 +719,51 @@ def test_web_studio_status(web: Running) -> None:
     assert web.http.get("/panel/web-studio/status", headers={"Host": HOST}).status_code == 403
 
 
+def test_web_studio_down(web: Running, caplog: pytest.LogCaptureFixture) -> None:
+    """The app keeps exiting after each restart: "down", why, and one log warning."""
+    import json
+    import time
+
+    ws = web.svc.cfg.web_studio
+    fetch = {"Host": HOST, "Sec-Fetch-Site": "same-origin"}
+    since = time.mktime((2026, 10, 2, 10, 13, 0, 0, 0, -1))
+    failing = {
+        "viewers": 0,
+        "app_running": False,
+        "failing": True,
+        "last_exit": 255,
+        "failures": 5,
+        "failing_since": since,
+        "next_try": since + 32 * 60,
+    }
+    ws.status.write_text(json.dumps({**failing, "updated": time.time()}))
+    with caplog.at_level("WARNING", logger="os2slice.server"):
+        for _ in range(3):
+            got = web.http.get("/panel/web-studio/status", headers=fetch).json()
+            assert got == {
+                "state": "down",
+                "viewers": 0,
+                "reason": "Bambu Studio keeps exiting (status 255, 5 tries since 10:13); "
+                "retrying at 10:45",
+            }
+    warnings = [r for r in caplog.records if "is down" in r.getMessage()]
+    assert len(warnings) == 1 and "status 255" in warnings[0].getMessage()
+    # A new streak is logged again.
+    caplog.clear()
+    ws.status.write_text(
+        json.dumps({**failing, "failing_since": since + 1, "updated": time.time()})
+    )
+    with caplog.at_level("WARNING", logger="os2slice.server"):
+        web.http.get("/panel/web-studio/status", headers=fetch)
+    assert "is down" in caplog.text
+    # A stale file says nothing about now: unknown, as before.
+    ws.status.write_text(json.dumps({**failing, "updated": time.time() - 60}))
+    assert web.http.get("/panel/web-studio/status", headers=fetch).json() == {
+        "state": "unknown",
+        "viewers": None,
+    }
+
+
 def test_web_studio_refusals(srv: Running, web: Running) -> None:
     _, form = panel_form(web)
     cross = {"Host": HOST, "Sec-Fetch-Site": "cross-site"}

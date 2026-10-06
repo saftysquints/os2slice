@@ -780,7 +780,8 @@ class _Handler(BaseHTTPRequestHandler):
         if self.headers.get("Sec-Fetch-Site") != "same-origin":
             raise Forbidden("Only for the print panel")
         ws = self._web_studio(app)
-        self._send(200, json.dumps(web_studio_status(ws)).encode(), "application/json")
+        status = web_studio_status(ws, WEB_APPS[app][1])
+        self._send(200, json.dumps(status).encode(), "application/json")
 
     def _post_web_studio(self, app: str) -> None:
         """Hand the selection's 3MF to the shared session; the tab opens client-side."""
@@ -1210,8 +1211,12 @@ def _selection(form: dict[str, str], panel: bool) -> Selection:
     return req, face, orientation, printer, material, extra, process, machine
 
 
-def web_studio_status(ws: WebStudioConfig, now: float | None = None) -> dict[str, Any]:
-    """{"state": "free" | "busy" | "unknown", "viewers": n} from the add-on's status file."""
+_web_failing_logged: dict[str, float] = {}  # app label → the failing_since already logged
+
+
+def web_studio_status(ws: WebStudioConfig, label: str, now: float | None = None) -> dict[str, Any]:
+    """{"state": "free" | "busy" | "unknown" | "down", "viewers": n} from the add-on's
+    status file; "down" (the app keeps exiting right after each restart) adds a "reason"."""
     now = time.time() if now is None else now
     try:
         data = json.loads(ws.status.read_text())
@@ -1220,9 +1225,36 @@ def web_studio_status(ws: WebStudioConfig, now: float | None = None) -> dict[str
         return {"state": "unknown", "viewers": None}
     if now - updated > 15:  # the add-on writes it every 2 s
         return {"state": "unknown", "viewers": None}
+    if data.get("failing") is True:
+        try:
+            reason = _web_down_reason(label, data)
+        except (ValueError, KeyError, TypeError, OverflowError, OSError):
+            reason = f"{label} keeps exiting"
+        return {"state": "down", "viewers": viewers, "reason": reason}
     if data.get("app_running") is False:  # desktop up, Bambu Studio not (yet) running
         return {"state": "unknown", "viewers": viewers}
     return {"state": "busy" if viewers > 0 else "free", "viewers": viewers}
+
+
+def _web_down_reason(label: str, data: dict[str, Any]) -> str:
+    """'Bambu Studio keeps exiting (status 255, 5 tries since 10:13); retrying at 10:45'.
+
+    Logged once per failure streak (its failing_since), not on every poll.
+    """
+
+    def hhmm(t: float) -> str:
+        return time.strftime("%H:%M", time.localtime(t))
+
+    status, tries = int(data["last_exit"]), int(data["failures"])
+    since, next_try = float(data["failing_since"]), float(data["next_try"])
+    reason = (
+        f"{label} keeps exiting (status {status}, {tries} tries since {hhmm(since)}); "
+        f"retrying at {hhmm(next_try)}"
+    )
+    if _web_failing_logged.get(label) != since:
+        _web_failing_logged[label] = since
+        log.warning("the web %s is down: %s", label, reason)
+    return reason
 
 
 def _parse_extra(value: str) -> list[tuple[str, str]]:
