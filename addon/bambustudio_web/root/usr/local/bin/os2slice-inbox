@@ -3,7 +3,10 @@
 
 Every few seconds:
 - writes /share/os2slice/web-studio.json: {"viewers": n, "updated": unix time}
-  (n = browser connections to the Selkies stream on 127.0.0.1:8082);
+  (n = browser connections to the Selkies stream on 127.0.0.1:8082), plus
+  "failing", "last_exit", "failures", "failing_since" and "next_try" while the
+  app keeps exiting right after a restart;
+- restarts Bambu Studio when it isn't running, backing off when it won't stay up;
 - moves each finished *.3mf from the inbox into /config/os2slice-files and opens
   it in the running Bambu Studio (single instance, so it joins the open window).
 
@@ -38,6 +41,74 @@ APP = ENV("OS2SLICE_APP", "/opt/bambustudio/AppRun")
 APP_PROC = ENV("OS2SLICE_APP_PROC", "bin/bambu-studio")  # pgrep -f pattern of the app
 APP_NAME = ENV("OS2SLICE_APP_NAME", "Bambu Studio")
 KEEP_DAYS = 7
+QUICK_EXIT = 30  # seconds: a restart that exits sooner counts as a failure
+MAX_QUICK = 3  # quick failures in a row before backing off
+MAX_DELAY = 1800  # seconds: the longest wait between restarts
+
+
+class Backoff:
+    """Counts watchdog restarts that exit within QUICK_EXIT and spaces out the next ones.
+
+    On 2026-10-02 Bambu Studio exited with status 255 right after every restart, and
+    the watchdog retried once a minute for 4 days with nothing visible but "unavailable".
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    @property
+    def failing(self) -> bool:
+        return self.failures >= MAX_QUICK
+
+    def delay(self) -> float:
+        """Seconds to wait before the next restart: 0 (normal pace) until MAX_QUICK."""
+        if not self.failing:
+            return 0.0
+        return float(min(60 * 2 ** (self.failures - MAX_QUICK), MAX_DELAY))
+
+    def may_launch(self, now: float) -> bool:
+        return now >= self.next_try
+
+    def reset(self) -> None:
+        """The app is up (a restart survived QUICK_EXIT, or something else started it)."""
+        self.failures = 0
+        self.last_exit: int | None = None
+        self.failing_since: float | None = None
+        self.next_try = 0.0
+        self._said_delay: float | None = None
+
+    def exited(self, status: int, ran: float, now: float) -> str | None:
+        """A watchdog restart ended; returns a line for the supervisor log, or None."""
+        if ran >= QUICK_EXIT:
+            self.reset()
+            return None
+        self.failures += 1
+        self.last_exit = status
+        if self.failing_since is None:
+            self.failing_since = now
+        delay = self.delay()
+        self.next_try = now + delay
+        if not self.failing or delay == self._said_delay:
+            return None  # not failing yet, or already said so
+        self._said_delay = delay
+        when = f"{delay / 60:.0f} min" if delay >= 60 else f"{delay:.0f} s"
+        return (
+            f"os2slice-inbox: {APP_NAME} exited with status {status} after {ran:.1f} s, "
+            f"{self.failures} times in a row; next try in {when}"
+        )
+
+    def fields(self) -> dict[str, object]:
+        """The status file's extra keys; empty unless failing."""
+        if not self.failing:
+            return {}
+        return {
+            "failing": True, "last_exit": self.last_exit, "failures": self.failures,
+            "failing_since": int(self.failing_since or 0), "next_try": int(self.next_try),
+        }  # fmt: skip
+
+
+BACKOFF = Backoff()
+LAUNCHED: list[tuple[subprocess.Popen[bytes], float, bool]] = []  # (proc, started, watchdog)
 
 
 def viewers() -> int:
@@ -56,6 +127,7 @@ def app_running() -> bool:
 def write_status(n: int) -> None:
     tmp = STATUS.with_suffix(".tmp")
     data = {"viewers": n, "app_running": app_running(), "updated": int(time.time())}
+    data.update(BACKOFF.fields())
     tmp.write_text(json.dumps(data))
     os.replace(tmp, STATUS)
 
@@ -152,16 +224,52 @@ def launch(args: list[str]) -> bool:
         return False
     with APP_LOG.open("ab") as log:
         log.write(f"\n--- {time.ctime()} launching {args} with {sorted(env)}\n".encode())
-        # Wrapped so the exit status ends up in the log too (diagnosing silent exits).
-        quoted = " ".join(["'" + x.replace("'", "'\\''") + "'" for x in [APP, *args]])
-        subprocess.Popen(
-            ["s6-setuidgid", "abc", "sh", "-c", f'{quoted}; echo "--- exited with status $?"'],
+        proc = subprocess.Popen(
+            ["s6-setuidgid", "abc", APP, *args],
             env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+    # Kept so reap() can log the exit status and judge watchdog restarts. File opens
+    # are single-instance handoffs that exit quickly by design: never failures.
+    LAUNCHED.append((proc, time.time(), not args))
     if args:
         threading.Thread(target=diagnose, args=(env,), daemon=True).start()
     return True
+
+
+def reap() -> None:
+    """Log launches that ended; feed watchdog restarts to BACKOFF."""
+    now = time.time()
+    for item in list(LAUNCHED):
+        proc, started, watchdog = item
+        status = proc.poll()
+        if status is None:
+            if watchdog and now - started >= QUICK_EXIT and BACKOFF.failures:
+                app_up()  # it stayed up
+            continue
+        LAUNCHED.remove(item)
+        ran = now - started
+        with APP_LOG.open("ab") as log:
+            log.write(f"--- exited with status {status} after {ran:.1f} s\n".encode())
+        if not watchdog:
+            continue
+        if ran < QUICK_EXIT and app_running():
+            continue  # the launcher handed off to a running app: not a failure
+        was_failing = BACKOFF.failing
+        if line := BACKOFF.exited(status, ran, now):
+            print(line, flush=True)
+        elif was_failing and not BACKOFF.failing:
+            print(f"os2slice-inbox: {APP_NAME} is up again", flush=True)
+
+
+def app_up() -> None:
+    if BACKOFF.failing:
+        print(f"os2slice-inbox: {APP_NAME} is up again", flush=True)
+    BACKOFF.reset()
+
+
+def watchdog_alive() -> bool:
+    return any(w and p.poll() is None for p, _, w in LAUNCHED)
 
 
 def open_file(path: Path) -> None:
@@ -198,12 +306,17 @@ def main() -> int:
     while True:
         try:
             # Watchdog: keep Bambu Studio running on the desktop.
-            if app_running() or not session_env():
+            reap()
+            running = app_running()
+            if running and not watchdog_alive():
+                app_up()  # up without a restart of ours (the image's autostart)
+            if running or not session_env():
                 missing_since = None
             elif missing_since is None:
                 missing_since = time.time()
-            elif time.time() - missing_since > RESTART_AFTER:
-                print(f"os2slice-inbox: {APP_NAME} isn't running; starting it", flush=True)
+            elif time.time() - missing_since > RESTART_AFTER and BACKOFF.may_launch(time.time()):
+                if not BACKOFF.failing:  # while failing, reap() says it once per delay
+                    print(f"os2slice-inbox: {APP_NAME} isn't running; starting it", flush=True)
                 launch([])
                 missing_since = time.time() + 40  # give it time to come up
             write_status(viewers())

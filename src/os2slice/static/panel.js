@@ -31,6 +31,7 @@
     label: link.dataset.label,
     state: document.getElementById(`${link.dataset.app}-state`),
     status: "unknown",
+    reason: "", // why it's "down", from the server
     sending: false, // a part is on its way to that session
   }));
   let selectionOk = false;
@@ -361,16 +362,26 @@
   // The shared Bambu Studio in the browser (one session for everyone, D-21).
   function updateWebApps() {
     for (const w of webApps) {
-      const label = { free: "(free)", busy: "(in use)", unknown: "(unavailable)" }[w.status];
+      const label = {
+        free: "(free)", busy: "(in use)", unknown: "(unavailable)", down: "(not starting)",
+      }[w.status];
       if (!w.sending) w.state.textContent = label || "";
-      w.link.classList.toggle("off", !(selectionOk && w.status !== "unknown"));
+      // "down": the app keeps exiting; hovering says why and when it's retried.
+      const why = w.status === "down" ? w.reason : "";
+      w.state.title = why;
+      w.link.title = why;
+      const usable = w.status !== "unknown" && w.status !== "down";
+      w.link.classList.toggle("off", !(selectionOk && usable));
     }
   }
 
   async function pollWebApp(w) {
+    w.reason = "";
     try {
       const res = await fetch(`/panel/${w.app}/status`, { credentials: "same-origin" });
-      w.status = res.ok ? (await res.json()).state : "unknown";
+      const body = res.ok ? await res.json() : { state: "unknown" };
+      w.status = body.state;
+      w.reason = body.reason || "";
     } catch {
       w.status = "unknown";
     }
