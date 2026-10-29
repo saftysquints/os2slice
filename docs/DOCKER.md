@@ -159,6 +159,23 @@ bed_type = "High Temp Plate"
 
 PrusaLink targets are built from their API docs and not yet tested on a printer.
 
+**Formlabs Form 4.** The `preform` profile runs Formlabs' own PreForm Server for Linux (`formlabs/preform-server`, pinned by `PREFORM_TAG` in `.env`). os2slice's `preform-server` module both slices and sends: it imports the part, orients it (your face down, or PreForm's auto-orient), adds supports, lays out copies, runs PreForm's checks, saves a `.form` job and puts it in the printer's queue. Files go through the shared volume (`/share/os2slice/preform`); the server publishes no port, since its API has no authentication.
+
+```toml
+[targets.formlabs]
+kind = "preform-server"
+url = "http://preform-server:44388"
+printers = ["192.168.1.142"]   # the Form 4's address (give it a DHCP reservation): mDNS doesn't reach containers
+version = "3.64.1.664"         # what PREFORM_TAG runs; doctor warns when they differ
+# share_dir = "/share/os2slice/preform"   # the default
+# remote_start = false         # default: jobs wait on the printer's touchscreen (D-36)
+
+[targets.formlabs.models."Form 4"]   # optional defaults; without them: the loaded resin at 0.1 mm
+profiles = { printer = "FORM-4-0", process = "0.1 mm", filament = "FLGPGR05" }
+```
+
+The Form 4 appears in the printer menu as `formlabs/<its serial name>`, with the loaded resin first in the Resin menu and the layer heights PreForm offers. API notes in [`PREFORM_API.md`](PREFORM_API.md).
+
 ## Day to day
 
 | Task | Command |

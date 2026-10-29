@@ -28,7 +28,7 @@ Onshape (browser) ──panel / right-click──▶ os2slice ──▶ Onshape 
 | OrcaSlicer API sidecar | `orca-slicer-api` | verified live in local Docker |
 | Klipper through Moonraker | `moonraker` | built from the API docs, not yet tested on hardware |
 | Prusa through PrusaLink | `prusalink` | built from the API docs, not yet tested on hardware |
-| PreForm (Formlabs Form 4) | `preform-server` | planned ([#2](https://github.com/jlbimson/os2slice/issues/2)) |
+| Formlabs Form 4 through PreForm Server (slices and queues) | `preform-server` | built from API calls verified live against the server, not yet run from os2slice |
 
 [`docs/MODULES.md`](docs/MODULES.md) has the details and the config format.
 
@@ -89,6 +89,12 @@ For Bambu Studio in the browser (optional):
 3. Restart the add-on once.
 
 See [`addon/bambustudio_web/DOCS.md`](addon/bambustudio_web/DOCS.md).
+
+For a Formlabs Form 4 (optional):
+1. Run `scripts/deploy_addon.sh deploy preform_server` (built on the machine from Formlabs' `formlabs/preform-server` image; it publishes no port).
+2. On `/admin`, add a target of kind `preform-server` with URL `http://local-preform-server:44388` and the Form 4's IP address under `printers`.
+
+See [`addon/preform_server/DOCS.md`](addon/preform_server/DOCS.md) and [`docs/PREFORM_API.md`](docs/PREFORM_API.md).
 
 ### Virtual printers (for sending from the web Bambu Studio)
 

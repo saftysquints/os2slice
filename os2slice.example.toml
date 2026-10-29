@@ -32,7 +32,8 @@ name = "PrusaSlicer"
 argv = ["flatpak", "run", "--file-forwarding", "com.prusa3d.PrusaSlicer", "--single-instance", "@@", "{file}", "@@"]
 # Native: argv = ["prusa-slicer", "--single-instance", "{file}"]
 
-# PreForm has no Linux support (docs/DECISIONS.md D-2). Windows example (Phase 4):
+# Desktop PreForm has no Linux build (docs/DECISIONS.md D-2); on the server, Form 4 prints
+# go through PreForm Server (a preform-server target, below). Windows example (Phase 4):
 # [slicers.preform]
 # name = "PreForm"
 # argv = ["C:/Program Files/Formlabs/PreForm/PreForm.exe", "{file}", "--silentRepair", "--modelUnits", "mm"]
@@ -92,7 +93,7 @@ bed_type = "High Temp Plate"   # smooth PEI; per-model [bambuddy.presets.*] bed_
 # # api key: optional, secret store entry "slicers.studio-api.api_key"
 #
 # A target hands the print file to a printer or a queue. Kinds: bambuddy (slices too),
-# moonraker, prusalink (docs/PRINTER_APIS.md).
+# moonraker, prusalink (docs/PRINTER_APIS.md), preform-server (slices too).
 # [targets.voron]
 # kind = "moonraker"
 # url = "http://voron.lan:7125"
@@ -125,3 +126,16 @@ bed_type = "High Temp Plate"   # smooth PEI; per-model [bambuddy.presets.*] bed_
 #
 # [printers."A1 Mini"]               # overrides for one discovered printer, by name
 # slicer = "studio-api"
+#
+# A Formlabs Form 4 through PreForm Server (docs/PREFORM_API.md, D-36). It slices and sends;
+# jobs wait on the printer's touchscreen unless remote_start = true.
+# [targets.formlabs]
+# kind = "preform-server"
+# url = "http://local-preform-server:44388"   # the PreForm Server HA add-on; Compose: http://preform-server:44388
+# printers = ["192.168.1.142"]       # printer addresses to look up (mDNS doesn't reach containers)
+# version = "3.64.1.664"             # the pinned server version; doctor warns when it differs
+# share_dir = "/share/os2slice/preform"   # shared with the server, one folder per job
+# raft_type = ""                     # optional: FULL_RAFT, MINI_RAFT, MINI_RAFTS_ON_BP
+#
+# [targets.formlabs.models."Form 4"]   # optional; default: the loaded resin at 0.1 mm
+# profiles = { printer = "FORM-4-0", process = "0.1 mm", filament = "FLGPGR05" }

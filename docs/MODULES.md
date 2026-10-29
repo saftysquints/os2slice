@@ -26,7 +26,7 @@ The contract is `src/os2slice/modules/base.py`. Read it before touching a module
 | `moonraker` | target | fdm | `gcode` | built (`modules/moonraker.py`); read from docs, not yet tested on a printer; `docs/PRINTER_APIS.md` |
 | `prusalink` | target | fdm | `gcode`, `bgcode` | built (`modules/prusalink.py`); read from docs, not yet tested on a printer |
 | `octoprint` | target | fdm | `gcode` | later |
-| `preform-server` | slicer + target (pair only with itself) | sla | `form` | Formlabs Form 4, issue #2 |
+| `preform-server` | slicer + target (pair only with itself) | sla | makes and accepts `form` | built (`modules/preform.py`, D-36); Formlabs PreForm Server container (`addon/preform_server`, Compose profile `preform`); fake-tested, not yet run from os2slice; `docs/PREFORM_API.md` |
 | `desktop` | hand-off | any | n/a | the local mode (`[slicers.*]` with `argv`), unchanged |
 
 Pairings that load: either sidecar → `bambuddy` (`gcode.3mf`, BamBuddy uploads it to its
@@ -40,7 +40,7 @@ refuses a printer (or a model default) whose pair can't work, a slicer key that 
 exist, and a desktop hand-off named as a printer's slicer (it can't slice on the server).
 The print gets the first medium in the target's `accepts` that the slicer `makes`.
 
-**Role "both".** A module whose spec has `role = "both"` (BamBuddy, later PreForm) is
+**Role "both".** A module whose spec has `role = "both"` (BamBuddy, PreForm Server) is
 configured once, under `[targets.<key>]`. It is one instance that is both that target
 and a slicer of the same key: a printer or a model default may name `<key>` as its
 `slicer`, and an empty `slicer` means "the target slices for itself". A
@@ -250,6 +250,44 @@ filled-in secret option replaces its page value at each start (D-32).
 5. "Open in Bambu Studio" (D-21) slices with the printer's slicer when it makes
    `gcode.3mf` and copies that file's `Metadata/project_settings.config` onto the
    project built from the same `SliceInput`.
+
+## Resin printers (SLA, D-36)
+
+A printer whose `technology` is `sla` (today: a Form 4 from a `preform-server` target)
+goes through the same path with resin settings:
+
+- Profiles reuse the FDM slots: `printer` = PreForm machine type (`FORM-4-0`), `process` =
+  layer height (`"0.1 mm"`), `filament` = resin code (`FLGPGR05`). The panel's process menu
+  is "Layer height" (the module's `own_profiles().process`, every layer PreForm's catalog
+  lists); the material menu is "Resin": the tank's resin first ("Grey V5 (loaded)", the
+  default), then the catalog's other resins for that machine. `Material.id` is the code.
+- `plan_print` uses `PrintSettings.for_sla()`: only supports (`off` = none, printed on the
+  build platform; anything else = PreForm's auto-supports, shown as `normal`) and copies
+  reach the slicer. Walls, infill, layers, brim, plate, extras, tools and machine
+  profiles are dropped, not refused. Untouched, a resin printer starts with auto supports
+  and auto-orient (panel, page and CLI).
+- A resin print is one material: parts with different resins → BadRequest. The module
+  merges the parts into one mesh (they already share one rotation and drop).
+- The right-click page has no script, so with both kinds configured it renders one form
+  per technology ("Filament printers" / "Resin printers"), each with its own CSRF token.
+  The panel switches live on the printer option's `data-tech`, hiding and disabling the
+  FDM-only fields so they aren't sent. "Open in Bambu Studio" refuses resin printers.
+- The job page and CLI show the print time, layers, `report["volume_ml"]` ("≈ 7.4 mL
+  resin") and `Submission.detail`. Every `SliceOutput.warnings` line (PreForm's cups,
+  unsupported minima, supportedness, manifoldness, bounds) is logged and shown, for any
+  technology.
+- The module (`modules/preform.py`): each `slice()` makes its own scene and job folder
+  under `share_dir` (create → import with repair → auto-orient, or an identity orient that
+  seats the core's orientation on the platform → auto-support → duplicate + auto-layout →
+  checks → print time → save `.form`) and removes both; `submit()` reopens the `.form`,
+  looks the printer up by IP and uploads with `print_now` always explicit: `true` only
+  when Wait for Start is off **and** the target's `remote_start` is on, else the job waits
+  on the touchscreen. Printers come from `device/list` (virtual ones dropped) plus a
+  `device/discover` per configured address, with a 60 s back-off; an address never found
+  is listed inactive. `check()` warns when the server's version differs from `version`.
+- A target that can't list its printers is logged and left out of the printer menu, so
+  one stopped service doesn't hide the others' printers. An override without `target`
+  needs a slicer that suits at least one discovering target.
 
 Optional on a target: `ui_url(request_host="") -> str`, its own queue page, for links
 that belong to no single printer (the panel, job pages). BamBuddy derives

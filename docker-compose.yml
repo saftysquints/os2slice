@@ -6,6 +6,7 @@
 #   docker compose --profile web-studio --profile duckdns up -d --build   # everything
 #   docker compose --profile orca up -d --build        # os2slice + an OrcaSlicer sidecar
 #   docker compose --profile orca --profile orca-web up -d --build   # + OrcaSlicer in a browser
+#   docker compose --profile preform up -d --build     # os2slice + PreForm Server (Form 4)
 #
 # BamBuddy runs separately (its own compose file, host networking); these services reach
 # it on the Docker host as host.docker.internal.
@@ -89,6 +90,24 @@ services:
     volumes:
       - orca-web-config:/config
       - shared:/share/os2slice  # os2slice's inbox for it, and its status file
+
+  # Formlabs' PreForm Server (optional), for a [targets.<key>] with kind = "preform-server"
+  # and url = "http://preform-server:44388". Its API has no authentication, so it publishes
+  # no port: only os2slice, on this compose network, can reach it. Pulled from Formlabs'
+  # Docker Hub image as is; pin the tag and the target's `version` together.
+  preform-server:
+    profiles: ["preform"]
+    image: formlabs/preform-server:${PREFORM_TAG:-release-3.64.1.664}
+    restart: unless-stopped
+    command: ["--port", "44388"]
+    user: "1000:1000"  # the os2slice user, which removes the job files it hands over
+    environment:
+      DISABLE_PREFORMSERVER_TELEMETRY: "1"
+    # A restart with a persistent /tmp finds Xvfb's stale lock and never answers again.
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    volumes:
+      - shared:/share/os2slice  # /share/os2slice/preform: STL in, .form out
 
   # Points <name>.duckdns.org at this machine's LAN address and keeps the HTTPS
   # certificate in ./certs (optional; skip it if you bring your own certificate).

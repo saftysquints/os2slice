@@ -1,0 +1,17 @@
+# Home Assistant local add-on: Formlabs PreForm Server, for os2slice's Form 4 prints.
+# Deployed to /local_apps/preform_server by scripts/deploy_addon.sh. See docs/DECISIONS.md D-36.
+name: PreForm Server
+version: "3.64.1.664-1"  # <PreForm Server version>-<add-on revision>
+slug: preform_server
+description: Formlabs PreForm Server (headless PreForm behind a local API), used by os2slice to prepare and send Form 4 jobs
+arch:
+  - amd64
+startup: services
+boot: auto
+init: false  # the image's entrypoint starts Xvfb, then the server as PID 1
+# No ports: the API has no authentication. os2slice reaches it on the Supervisor's
+# internal network as http://local-preform-server:44388.
+tmpfs: true  # a restart finds Xvfb's stale lock in a persistent /tmp and never comes back
+map:
+  - type: share  # /share/os2slice/preform: STL and .form files os2slice hands over
+    read_only: false

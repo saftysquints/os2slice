@@ -23,8 +23,9 @@ Onshape (browser, any machine on the printers' LAN)
                                 ├─ orient: one rotation (face-down normal → −Z), drop to Z = 0
                                 ├─ the printer's slicer module: SliceInput → slice() → SliceOutput
                                 │     bambuddy (slices in BamBuddy) | bambu-studio-api / orca-slicer-api (sidecars)
+                                │     | preform-server (PreForm Server container, .form for the Form 4)
                                 ├─ the printer's target module: submit(start=False) → Submission
-                                │     bambuddy (queue) | moonraker | prusalink
+                                │     bambuddy (queue) | moonraker | prusalink | preform-server (Form 4 queue)
                                 └─ /jobs/<id> shows progress and the result
   /admin   the config page (admin.py): modules, printers, defaults, secrets, doctor, jobs, log
 ```
@@ -38,13 +39,18 @@ Onshape (browser, any machine on the printers' LAN)
   configured by hand (`[printers.<key>]`). Pairing rules and the config schema:
   [`MODULES.md`](MODULES.md).
 - Modules call only their configured URL. Endpoint notes: [`BAMBUDDY_API.md`](BAMBUDDY_API.md),
-  [`SLICERAPI_API.md`](SLICERAPI_API.md), [`PRINTER_APIS.md`](PRINTER_APIS.md).
+  [`SLICERAPI_API.md`](SLICERAPI_API.md), [`PRINTER_APIS.md`](PRINTER_APIS.md),
+  [`PREFORM_API.md`](PREFORM_API.md).
+- PreForm Server (D-36) has no authentication and open CORS, so its port is never
+  published: os2slice reaches it on the Supervisor's internal network
+  (`local-preform-server`) or the Compose network (`preform-server`). Files pass through
+  `/share/os2slice/preform`, one folder per job, removed when the job is done.
 - `Service.reload()` swaps config and modules after an `/admin` save; server and Onshape
   settings apply after a restart (D-31).
 - "Open in Bambu Studio" (D-21) slices with the printer's slicer and hands a project 3MF to
   the shared web Bambu Studio (`/share/os2slice/inbox`) or offers it as a download link.
 - Safety model: D-13. Access: D-17. Sign-in: D-23. Packaging: D-12 (add-on), D-24 (Docker).
-  Modules: D-27, D-29, D-30. Config page: D-28, D-31, D-32.
+  Modules: D-27, D-29, D-30, D-36 (resin). Config page: D-28, D-31, D-32.
 
 ## Secondary: local-slicer mode (Phases 0–1)
 
@@ -108,8 +114,9 @@ src/os2slice/
     slicerapi.py      Bambu Studio / OrcaSlicer API sidecars (bambu-studio-api, orca-slicer-api)
     moonraker.py      Klipper through Moonraker (target)
     prusalink.py      Prusa printers through PrusaLink (target)
+    preform.py        Formlabs Form 4 through PreForm Server: slicer + target (role "both")
     bambu_project.py  Bambu/Orca project layout (centring, copies, filaments, prime tower)
-addon/            Home Assistant add-ons: os2slice, bambustudio_web
+addon/            Home Assistant add-ons: os2slice, bambustudio_web, preform_server
 docker/           Docker Compose settings examples and the Duck DNS script
 tests/            unit tests; fakes*.py are recorded HTTP shapes
 scripts/          deploy_addon.sh, spikes, one-offs

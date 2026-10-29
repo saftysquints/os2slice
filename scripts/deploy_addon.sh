@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Stage Home Assistant local add-ons and (optionally) deploy them over SSH.
 #
-#   scripts/deploy_addon.sh stage  <dir> [os2slice|bambustudio_web]   # build a staging folder
-#   scripts/deploy_addon.sh deploy       [os2slice|bambustudio_web]   # copy, install or rebuild
+#   scripts/deploy_addon.sh stage  <dir> [os2slice|bambustudio_web|preform_server]   # build a staging folder
+#   scripts/deploy_addon.sh deploy       [os2slice|bambustudio_web|preform_server]   # copy, install or rebuild
 #
 # Only source code goes over: no keys, tests, git history or local config.
 set -euo pipefail
@@ -28,6 +28,9 @@ stage() {
       ;;
     bambustudio_web)
       (cd "$ROOT/addon/bambustudio_web" && tar -c --exclude='__pycache__' .) | tar -x -C "$out"
+      ;;
+    preform_server)
+      cp "$ROOT"/addon/preform_server/{config.yaml,Dockerfile,DOCS.md} "$out/"
       ;;
     *) echo "unknown add-on $addon" >&2; exit 2 ;;
   esac
