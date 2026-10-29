@@ -29,6 +29,7 @@ from os2slice.modules.base import (
     Target,
 )
 from os2slice.modules.moonraker import Moonraker
+from os2slice.modules.preform import PreformServer
 from os2slice.modules.prusalink import PrusaLink
 from os2slice.modules.slicerapi import BambuStudioApi, OrcaSlicerApi
 
@@ -41,11 +42,13 @@ SLICERS: dict[str, type[Any]] = {
     "bambuddy": BambuddyModule,
     "bambu-studio-api": BambuStudioApi,
     "orca-slicer-api": OrcaSlicerApi,
+    "preform-server": PreformServer,
 }
 TARGETS: dict[str, type[Any]] = {
     "bambuddy": BambuddyModule,
     "moonraker": Moonraker,
     "prusalink": PrusaLink,
+    "preform-server": PreformServer,
 }
 
 # The local hand-off (`[slicers.<key>]` with `argv`, D-3): not a server-side module,
@@ -223,8 +226,13 @@ class Modules:
         self.close()
 
     def printers(self) -> list[PrinterInfo]:
-        """Every target's printers, discovered and configured, in config order."""
+        """Every target's printers, discovered and configured, in config order.
+
+        A target that can't list its printers is logged and left out, so the others stay
+        printable; when none answers, its error is raised.
+        """
         out: list[PrinterInfo] = []
+        failed: ModuleError | None = None
         for key, target in self.targets.items():
             spec = target.spec
             mine = tuple(
@@ -232,7 +240,13 @@ class Modules:
                 for p in self.configured.values()
                 if p.target == key or (p.target is None and spec.discovers_printers)
             )
-            out.extend(target.printers(mine))
+            try:
+                out.extend(target.printers(mine))
+            except ModuleError as e:
+                log.warning("%s: printers unavailable: %s", key, e.one_line())
+                failed = failed or e
+        if failed is not None and not out:
+            raise failed
         return out
 
     def find(self, wanted: str | None, printers: list[PrinterInfo] | None = None) -> PrinterInfo:

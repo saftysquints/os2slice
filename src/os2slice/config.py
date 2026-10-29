@@ -748,8 +748,16 @@ def _check_pairs(
             if not discovering:
                 raise fail(f"{where} needs a target (no configured target discovers printers)")
             if p.slicer:
+                # An override applies to whichever target finds a printer of that name, so
+                # its slicer needs to suit one of them, not all (BamBuddy beside PreForm).
+                errors: list[ConfigError] = []
                 for t in discovering:
-                    pair(where, p.slicer, t)
+                    try:
+                        pair(where, p.slicer, t)
+                    except ConfigError as e:
+                        errors.append(e)
+                if len(errors) == len(discovering):
+                    raise errors[0]
             continue
         if p.target not in targets:
             raise fail(f"{where}.target: no [targets.{p.target}] is configured")

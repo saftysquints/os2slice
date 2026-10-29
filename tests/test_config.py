@@ -341,3 +341,19 @@ def test_panel_slicer_links(tmp_path: Path) -> None:
         config.parse({"panel": {"web_slicer": "orcaslicer"}}, tmp_path / "c")
     with pytest.raises(ConfigError, match=r"panel\.local_slicer must be one of"):
         config.parse({"panel": {"local_slicer": "cura"}}, tmp_path / "c")
+
+
+def test_override_without_target_needs_one_discovering_target_that_suits_it() -> None:
+    """Beside PreForm Server, a BamBuddy override's sidecar slicer still loads."""
+    data = {
+        "slicers": {"studio": {"kind": "bambu-studio-api", "url": "http://s:3001"}},
+        "targets": {
+            "farm": FARM,
+            "formlabs": {"kind": "preform-server", "url": "http://local-preform-server:44388"},
+        },
+        "printers": {"X1C_01": {"slicer": "studio"}, "Form4-A": {"slicer": "formlabs"}},
+    }
+    assert _parse(data).printers["X1C_01"].slicer == "studio"
+    data["printers"] = {"X1C_01": {"slicer": "nowhere"}}
+    with pytest.raises(ConfigError, match=r"no \[slicers\.nowhere\]"):
+        _parse(data)

@@ -329,7 +329,8 @@ def test_every_module_kind_is_registered() -> None:
     from os2slice.modules.slicerapi import BambuStudioApi, OrcaSlicerApi
 
     assert set(registry.kinds()) == {
-        "bambuddy", "bambu-studio-api", "orca-slicer-api", "moonraker", "prusalink", "desktop",
+        "bambuddy", "bambu-studio-api", "orca-slicer-api", "moonraker", "prusalink",
+        "preform-server", "desktop",
     }  # fmt: skip
     assert registry.SLICERS["bambu-studio-api"] is BambuStudioApi
     assert registry.SLICERS["orca-slicer-api"] is OrcaSlicerApi
@@ -352,3 +353,24 @@ def test_registry_builds_through_from_values() -> None:
     with registry.Modules(slicers={"studio": s}, targets={"voron": t}):
         pass
     assert s._client.is_closed and t._client.is_closed  # Modules.close() closed both
+
+
+class _StubTarget:
+    spec = registry.spec_for("moonraker")
+
+    def __init__(self, printers: tuple[PrinterInfo, ...] | ModuleError) -> None:
+        self._printers = printers
+
+    def printers(self, configured: tuple[PrinterInfo, ...]) -> tuple[PrinterInfo, ...]:
+        if isinstance(self._printers, ModuleError):
+            raise self._printers
+        return self._printers
+
+
+def test_printers_leave_out_a_target_that_cannot_list_them() -> None:
+    ok = PrinterInfo(key="v", name="v", technology="fdm", model="m", target="a", slicer="s")
+    down = ModuleError("PreForm Server at http://preform-server:44388 is unreachable")
+    mods = registry.Modules(targets={"a": _StubTarget((ok,)), "b": _StubTarget(down)})
+    assert mods.printers() == [ok]
+    with pytest.raises(ModuleError, match="unreachable"):
+        registry.Modules(targets={"b": _StubTarget(down)}).printers()
