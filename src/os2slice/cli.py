@@ -18,6 +18,7 @@ from os2slice.bambuddy import BambuddyClient
 from os2slice.errors import BadRequest, Os2sliceError
 from os2slice.logsetup import log_path, setup_logging
 from os2slice.modules import registry
+from os2slice.modules.base import MEDIA_FORM
 from os2slice.onshape import OnshapeClient
 from os2slice.orientation import Orientation
 from os2slice.request import (
@@ -26,7 +27,7 @@ from os2slice.request import (
     parse_listener_url,
     parse_onshape_url,
 )
-from os2slice.settings import SUPPORTS, PrintSettings
+from os2slice.settings import SLA_DEFAULT_SUPPORTS, SUPPORTS, PrintSettings
 from os2slice.slicers import flatpak_app_id, resolve_executable
 
 if TYPE_CHECKING:
@@ -80,19 +81,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pr.add_argument(
         "--orient",
-        default="as-modeled",
-        help="as-modeled | x+ x- y+ y- z+ z- (that side down) | face:<face id> | auto",
+        help="as-modeled | x+ x- y+ y- z+ z- (that side down) | face:<face id> | auto "
+        "(default: as-modeled; auto on a resin printer)",
     )
     pr.add_argument(
         "--slot",
         action="append",
-        help="print from this loaded filament (its id; on BamBuddy the global tray id: AMS n "
-        "slot s = n*4+s, external 254/255); one per --part",
+        help="print from this loaded filament or resin (its id; on BamBuddy the global tray "
+        "id: AMS n slot s = n*4+s, external 254/255); one per --part",
     )
     pr.add_argument("--plate", help="build plate, e.g. 'Textured PEI Plate' (default: config)")
     pr.add_argument("--walls", help="wall loops (1-10)")
     pr.add_argument("--infill", help="sparse infill percent (0-100)")
-    pr.add_argument("--supports", choices=SUPPORTS)
+    pr.add_argument(
+        "--supports",
+        choices=SUPPORTS,
+        help="default: config; on a resin printer off = none, else auto supports (default)",
+    )
     pr.add_argument("--build-plate-only", action="store_true", help="supports from the plate only")
     pr.add_argument("--top-layers", help="solid top layers (0-30)")
     pr.add_argument("--bottom-layers", help="solid bottom layers (0-30)")
@@ -187,7 +192,7 @@ def cmd_print(args: argparse.Namespace) -> int:
     cfg = config.load()
     if not cfg.targets:
         raise config.ConfigError("No printers are configured", f"Add [targets.*] to {cfg.path}")
-    orientation = Orientation.parse(args.orient)
+    orientation = Orientation.parse(args.orient or "as-modeled")
     settings = PrintSettings.from_strings(
         {
             k: v
@@ -224,7 +229,11 @@ def cmd_print(args: argparse.Namespace) -> int:
                 cfg.default_wait_for_start if args.wait_for_start is None else args.wait_for_start
             ),
         )  # fmt: skip
+        if plan.sla:
+            plan = _resin_defaults(plan, args)
         print("\n".join(plan.summary_lines()))
+        if plan.sla and (ignored := _fdm_flags(args)):
+            print(f"Note:        {', '.join(ignored)} don't apply to a resin printer; ignored")
         queue = not args.slice_only
         if queue and not _confirm(f"Print on {plan.printer.name}? [y/N] "):
             print("Cancelled; nothing was uploaded or printed.")
@@ -233,10 +242,15 @@ def cmd_print(args: argparse.Namespace) -> int:
             plan, cfg, onshape, modules, queue=queue, progress=lambda s: print(f"  … {s}")
         )
     s = outcome.slice
-    minutes = f"{s.print_time_s // 60} min" if s.print_time_s else "? min"
-    grams = f"{s.material_g:.1f} g" if s.material_g is not None else "? g"
-    where = ", ".join(f"{k} {v}" for k, v in s.report.items() if k not in ("module", "url"))
-    print(f"Sliced {s.filename}: {minutes}, {grams}" + (f" ({where})" if where else ""))
+    if s.media == MEDIA_FORM:
+        print(f"Sliced {s.filename}: {printing.resin_facts(s)}")
+    else:
+        minutes = f"{s.print_time_s // 60} min" if s.print_time_s else "? min"
+        grams = f"{s.material_g:.1f} g" if s.material_g is not None else "? g"
+        where = ", ".join(f"{k} {v}" for k, v in s.report.items() if k not in ("module", "url"))
+        print(f"Sliced {s.filename}: {minutes}, {grams}" + (f" ({where})" if where else ""))
+    for warning in s.warnings:
+        print(f"Warning: {warning}")
     sub = outcome.submission
     if sub is not None:
         how = (
@@ -244,8 +258,35 @@ def cmd_print(args: argparse.Namespace) -> int:
             if plan.manual_start
             else "it starts when free"
         )
-        print(f"Queued on {plan.printer.name} (queue item {sub.id}); {how}.")
+        if plan.sla:
+            print(f"Queued on {plan.printer.name} (job {sub.id}); {sub.detail or how}.")
+        else:
+            print(f"Queued on {plan.printer.name} (queue item {sub.id}); {how}.")
     return 0
+
+
+def _resin_defaults(plan: printing.PrintPlan, args: argparse.Namespace) -> printing.PrintPlan:
+    """A resin printer's own defaults where no flag was given: auto supports, auto-orient."""
+    if args.supports is None:
+        settings = dataclasses.replace(plan.settings, supports=SLA_DEFAULT_SUPPORTS)
+        plan = dataclasses.replace(plan, settings=settings)
+    if args.orient is None:
+        plan = dataclasses.replace(plan, orientation=Orientation.parse("auto"))
+    return plan
+
+
+def _fdm_flags(args: argparse.Namespace) -> list[str]:
+    """The FDM-only flags given, which a resin printer ignores."""
+    given = {
+        "--walls": args.walls,
+        "--infill": args.infill,
+        "--build-plate-only": args.build_plate_only or None,
+        "--top-layers": args.top_layers,
+        "--bottom-layers": args.bottom_layers,
+        "--brim": args.brim,
+        "--plate": args.plate,
+    }
+    return [flag for flag, value in given.items() if value is not None]
 
 
 def cmd_serve(args: argparse.Namespace) -> int:

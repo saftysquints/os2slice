@@ -21,6 +21,7 @@ from os2slice.errors import BadRequest, ConfigError
 from os2slice.filaments import preset_label
 from os2slice.modules import bambu_project
 from os2slice.modules.base import (
+    MEDIA_FORM,
     MEDIA_GCODE_3MF,
     Material,
     Media,
@@ -99,6 +100,11 @@ class PrintPlan:
     def multi(self) -> bool:
         return bool(self.extra)
 
+    @property
+    def sla(self) -> bool:
+        """A resin printer: one resin, layer height, supports and copies; no FDM settings."""
+        return self.printer.technology == "sla"
+
     def to_load(self) -> list[str]:
         """'T2: load PM ASA (now CR-PETG Transparent)' for tools the user assigned."""
         return [
@@ -108,6 +114,8 @@ class PrintPlan:
         ]
 
     def summary_lines(self) -> list[str]:
+        if self.sla:
+            return self._sla_summary_lines()
         if self.multi:
             what = [f"Parts:       {len(self.parts)} parts, one object  ({self.document_name})"]
             what += [f"  · {p.describe()}" for p in self.parts]
@@ -144,6 +152,38 @@ class PrintPlan:
             lines.insert(1, f"Config:      {self.req.configuration}")
         return lines
 
+    def _sla_summary_lines(self) -> list[str]:
+        if self.multi:
+            what = [f"Parts:       {len(self.parts)} parts, one print  ({self.document_name})"]
+            what += [f"  · {p.name}" for p in self.parts]
+        else:
+            what = [f"Part:        {self.part_name}  ({self.document_name})"]
+        resin = (
+            self.material.label
+            if self.material
+            else f"the configured resin ({self.profiles.filament})"
+        )
+        lines = [
+            *what,
+            f"Resin:       {resin}",
+            f"Printer:     {self.printer.name} ({self.printer.model}), "
+            f"now {self.status.describe()}",
+            f"Presets:     {self.profiles.printer} / {self.profiles.filament}",
+            f"Layer height: {self.profiles.process}",
+            f"Orientation: {self.orientation.describe()}",
+            f"Settings:    {self.settings.describe('sla')}",
+            "Start:       "
+            + (
+                f"waits in {self.target_label}'s queue until you press Start"
+                if self.manual_start
+                else "goes to the printer's queue; start it on the printer "
+                "if it doesn't start by itself"
+            ),
+        ]
+        if self.req.configuration:
+            lines.insert(1, f"Config:      {self.req.configuration}")
+        return lines
+
 
 @dataclass(frozen=True)
 class PrintOutcome:
@@ -154,6 +194,43 @@ class PrintOutcome:
     @property
     def queued(self) -> bool:
         return self.submission is not None
+
+
+def duration(seconds: int | None) -> str:
+    """'6 h 12 min', '42 min', or '? min' when the slicer didn't say."""
+    if not seconds:
+        return "? min"
+    hours, minutes = divmod(seconds // 60, 60)
+    return f"{hours} h {minutes} min" if hours else f"{minutes} min"
+
+
+def resin_facts(output: SliceOutput) -> str:
+    """A resin slice in one line: '6 h 12 min, 1234 layers, ≈ 7.4 mL resin'."""
+    facts = [duration(output.print_time_s)]
+    if output.layers:
+        facts.append(f"{output.layers} layers")
+    volume = output.report.get("volume_ml")
+    if isinstance(volume, int | float) and not isinstance(volume, bool):
+        facts.append(f"≈ {volume:.1f} mL resin")
+    return ", ".join(facts)
+
+
+def outcome_lines(plan: PrintPlan, outcome: PrintOutcome) -> list[str]:
+    """The job page's lines after the plan: what was sliced, its warnings, where it went."""
+    s, sub = outcome.slice, outcome.submission
+    if s.media == MEDIA_FORM:
+        lines = [f"Sliced:      {resin_facts(s)}"]
+    else:
+        minutes = f"{s.print_time_s // 60} min" if s.print_time_s else "?"
+        lines = [f"Sliced:      {minutes}, {s.material_g or 0:.1f} g"]
+    lines += [f"Warning:     {w}" for w in s.warnings]
+    item = sub.id if sub else "?"
+    if s.media == MEDIA_FORM:
+        detail = f"; {sub.detail}" if sub and sub.detail else ""
+        lines.append(f"Queued:      job {item} on {plan.printer.name}{detail}")
+    else:
+        lines.append(f"Queued:      item {item} on {plan.printer.name}")
+    return lines
 
 
 def rotation_for(
@@ -327,6 +404,9 @@ def plan_print(
     printed as one object. `process` and `machine` pick one of the user's own process and
     printer profiles in the printer's slicer instead of the configured ones.
     `manual_start` is the person's Wait for Start choice (default: start by itself).
+    On a resin printer (technology "sla") the plan keeps only supports and copies of
+    `settings`, ignores `bed_type` and `machine`, takes `process` as the layer height,
+    and every part prints in the same resin.
     """
     if not modules.targets:
         raise ConfigError(
@@ -340,6 +420,10 @@ def plan_print(
             f"No slicer presets configured for printer model {chosen.model!r}",
             f'Add [targets.{chosen.target}.models."{chosen.model}"] to {cfg.path}',
         )
+    sla = chosen.technology == "sla"
+    if sla:
+        # No plate, extra slicer settings or printer profile menu on a resin printer.
+        settings, bed_type, machine = settings.for_sla(), None, None
     target = modules.target_for(chosen)
     status = target.status(chosen)
     own = modules.own_profiles(chosen)
@@ -401,6 +485,10 @@ def plan_print(
         profiles = replace(profiles, filament=first.profile)
     extra: list[PartChoice] = []
     if extra_parts:
+        if sla and first is None:
+            raise BadRequest(
+                "Pick the resin for a print of several parts", "Choose one from the resin menu"
+            )
         if first is None:
             raise BadRequest(
                 "Pick a loaded filament for every part of a multi-material print",
@@ -415,6 +503,10 @@ def plan_print(
                 raise BadRequest(f"Part {part_id!r} isn't in this Part Studio")
             seen.add(part_id)
             m = resolve(mid)
+            if sla and first is not None and m.profile != first.profile:
+                raise BadRequest(
+                    "A resin print is one material", "Pick the same resin for every part"
+                )
             extra.append(PartChoice(part_id, part_names[part_id], m, m.profile))
     tools: tuple[Material, ...] = ()
     chosen_materials = [m for m in (first, *(p.material for p in extra)) if m is not None]
@@ -449,6 +541,13 @@ def plan_print(
             by_tool[n] = m
         tools = tuple(by_tool[n] for n in sorted(by_tool))
     configured_plate = chosen.extra.get("bed_type")
+    plate = (
+        None
+        if sla
+        else check_bed_type(bed_type)
+        or (configured_plate if isinstance(configured_plate, str) else None)
+        or cfg.default_bed_type
+    )
     return PrintPlan(
         req=req,
         document_name=onshape.get_document_name(req.document_id),
@@ -461,9 +560,7 @@ def plan_print(
         manual_start=manual_start,
         target_label=target.spec.label,
         material=first,
-        bed_type=check_bed_type(bed_type)
-        or (configured_plate if isinstance(configured_plate, str) else None)
-        or cfg.default_bed_type,
+        bed_type=plate,
         extra=tuple(extra),
         tools=tools,
     )
@@ -532,6 +629,8 @@ def execute_print(
     media = media_for(slicer.spec, target.spec)
     job = slice_input(plan, cfg, onshape, media, progress=progress, now=now, project=force_3mf)
     output = slicer.slice(job, progress)
+    for warning in output.warnings:
+        log.warning("%s on %s: slicer warning: %s", job.job_name, plan.printer.name, warning)
     if not queue:
         return PrintOutcome(job, output, None)
     progress(f"Queueing on {plan.printer.name}")
@@ -557,6 +656,8 @@ def studio_project(
     walls/infill/supports, prime tower). Slices but never queues. Falls back to
     geometry only (logged) when the slice fails, so the part still opens.
     """
+    if plan.sla:
+        raise BadRequest(f"{plan.printer.name} is a resin printer; it has no Bambu project")
     slicer = modules.slicer_for(plan.printer)
     job = slice_input(plan, cfg, onshape, MEDIA_GCODE_3MF, progress=progress, project=True)
     geometry = bambu_project.build_project(job)

@@ -63,6 +63,8 @@ from os2slice.settings import (
     COPIES_RANGE,
     PLATE_LABELS,
     SHELL_RANGE,
+    SLA_DEFAULT_SUPPORTS,
+    SLA_SUPPORTS,
     SUPPORTS,
     PrintSettings,
     check_bed_type,
@@ -150,6 +152,9 @@ WEB_APPS = {"web-studio": ("web_studio", "Bambu Studio"), "web-orca": ("web_orca
 WEB_STATUS_PATHS = {f"/panel/{app}/status": app for app in WEB_APPS}
 WEB_ROUTES = {"bambu-studio": "web-studio", "orcaslicer": "web-orca"}  # by slicer name
 DEFAULT_BED = (256, 256)  # the preview's bed when a printer doesn't say (PrinterInfo.bed_mm)
+SLA_DEFAULT_ORIENT = "auto"  # resin parts print tilted on supports: the slicer orients them
+# The right-click page's form per printer technology (it has no script to switch fields).
+TECH_HEADINGS = {"fdm": "Filament printers", "sla": "Resin printers"}
 JOB_PATH_RE = re.compile(r"/jobs/([A-Za-z0-9_-]{22})")
 
 OnshapeFactory = Callable[[], OnshapeClient]
@@ -624,8 +629,11 @@ class _Handler(BaseHTTPRequestHandler):
             doc = onshape.get_document_name(req.document_id)
             part = onshape.get_part_name(req)
         views = self._printer_views()
-        token = self.svc.tokens.issue(user, _bind(req))
-        body = _print_form(req, doc, part, views, cfg, token, self.svc)
+
+        def issue() -> str:
+            return self.svc.tokens.issue(user, _bind(req))
+
+        body = _print_form(req, doc, part, views, cfg, issue, self.svc)
         self._page(200, f"Print {part}", body)
 
     def _post_print(self, user: str, panel: bool) -> None:
@@ -659,13 +667,7 @@ class _Handler(BaseHTTPRequestHandler):
                 out = printing.execute_print(
                     plan, cfg, onshape, mods, queue=True, progress=progress
                 )
-            s = out.slice
-            lines = plan.summary_lines()
-            minutes = f"{s.print_time_s // 60} min" if s.print_time_s else "?"
-            lines.append(f"Sliced:      {minutes}, {s.material_g or 0:.1f} g")
-            item = out.submission.id if out.submission else "?"
-            lines.append(f"Queued:      item {item} on {plan.printer.name}")
-            return lines
+            return plan.summary_lines() + printing.outcome_lines(plan, out)
 
         back = "/panel?" + urlencode({k: v for k, v in fields.items() if k != "p"}) if panel else ""
         job = self.svc.jobs.start(user, f"Part on printer {printer}", work, back=back)
@@ -1042,6 +1044,39 @@ def _print_form(
     part: str,
     views: list[PrinterView],
     cfg: Config,
+    issue: Callable[[], str],
+    svc: Service,
+) -> str:
+    """The right-click page: one form per printer technology, each with its own token."""
+    config = (
+        f"<dt>Configuration</dt><dd><code>{_e(req.configuration)}</code></dd>"
+        if req.configuration
+        else ""
+    )
+    groups = _technology_groups(views, svc.modules.default_printer)
+    forms = "".join(
+        (f"\n<h2>{TECH_HEADINGS[tech]}</h2>" if len(groups) > 1 else "")
+        + _technology_form(req, tech, group, cfg, issue(), svc)
+        for tech, group in groups
+    )
+    return f"""
+<dl><dt>Part</dt><dd>{_e(part)}</dd><dt>Document</dt><dd>{_e(doc)}</dd>{config}</dl>{forms}"""
+
+
+def _technology_groups(
+    views: list[PrinterView], default_printer: str
+) -> list[tuple[str, list[PrinterView]]]:
+    """The printers by technology, the default printer's first; FDM alone when there are none."""
+    first = next((v.printer.technology for v in views if v.matches(default_printer)), "fdm")
+    techs = sorted({v.printer.technology for v in views} or {"fdm"}, key=lambda t: t != first)
+    return [(t, [v for v in views if v.printer.technology == t]) for t in techs]
+
+
+def _technology_form(
+    req: ExportRequest,
+    tech: str,
+    views: list[PrinterView],
+    cfg: Config,
     token: str,
     svc: Service,
 ) -> str:
@@ -1057,15 +1092,20 @@ def _print_form(
             ("csrf", token),
         )
     )
-    config = (
-        f"<dt>Configuration</dt><dd><code>{_e(req.configuration)}</code></dd>"
-        if req.configuration
-        else ""
-    )
-    return f"""
-<dl><dt>Part</dt><dd>{_e(part)}</dd><dt>Document</dt><dd>{_e(doc)}</dd>{config}</dl>
+    default = svc.modules.default_printer
+    if tech == "sla":
+        orient = _options(ORIENT_CHOICES, SLA_DEFAULT_ORIENT)
+        return f"""
 <form method="post" action="/print">{hidden}
-{_printer_select(views, svc.modules.default_printer)}
+{_printer_select(views, default, "sla")}
+<label>Orientation <select name="orient">{orient}</select></label>
+{_sla_settings_fields(cfg)}
+{_wait_field(svc)}
+<button type="submit">Slice and queue print</button>
+</form>"""
+    return f"""
+<form method="post" action="/print">{hidden}
+{_printer_select(views, default)}
 {_plate_select(cfg)}
 <label>Orientation <select name="orient">{_options(ORIENT_CHOICES, "as-modeled")}</select></label>
 {_settings_fields(cfg)}
@@ -1158,6 +1198,17 @@ Supports from the build plate only</label>
 <label>Copies <input type="number" name="copies" min="{COPIES_RANGE[0]}" max="{COPIES_RANGE[1]}" value="{d.copies}" required></label>
 </div>
 <label class="check"><input type="checkbox" name="brim" value="true"{checked(d.brim)}> Brim</label>"""  # noqa: E501
+
+
+def _sla_settings_fields(cfg: Config) -> str:
+    """A resin printer's settings: supports (none or auto) and copies."""
+    supports = _options(SLA_SUPPORTS, SLA_DEFAULT_SUPPORTS)
+    lo, hi = COPIES_RANGE
+    copies = cfg.print_defaults.copies
+    return f"""<div class="row">
+<label>Supports <select name="supports">{supports}</select></label>
+<label>Copies <input type="number" name="copies" min="{lo}" max="{hi}" value="{copies}" required></label>
+</div>"""  # noqa: E501
 
 
 @dataclass(frozen=True)
@@ -1314,13 +1365,17 @@ def _material_label(m: Material, printer: PrinterInfo) -> tuple[str, bool]:
 
 def _default_choice(view: PrinterView) -> str:
     """Prefer a loaded material of the configured kind, then a lone one, then the preset.
-    A pool's presets (not loaded anywhere) are never the default."""
+    A pool's presets (not loaded anywhere) are never the default. A resin printer lists
+    its loaded resin first ("Grey V5 (loaded)"), and that one is the default."""
     key = view.printer.key
     usable = [
         m for m in view.materials if printing.usable(m, view.printer) and not printing.is_preset(m)
     ]
     if not usable or not view.configured:
         return key
+    first = view.materials[0]
+    if view.printer.technology == "sla" and first in usable and first.label.endswith("(loaded)"):
+        return f"{key}|{first.id}"
     for m in usable:
         if m.profile == view.printer.profiles.filament:
             return f"{key}|{m.id}"
@@ -1331,10 +1386,16 @@ def _default_choice(view: PrinterView) -> str:
     return f"{key}|{usable[0].id}" if len(usable) == 1 else key
 
 
-def _printer_select(views: list[PrinterView], default_printer: str) -> str:
+def _printer_select(views: list[PrinterView], default_printer: str, technology: str = "fdm") -> str:
+    """The right-click page's combined printer and material menu."""
+    resin = technology == "sla"
     selected = next(
         (_default_choice(v) for v in views if v.matches(default_printer) and v.configured), ""
     )
+    if resin and not selected:
+        # The default printer is in the other form: start on the first printer's resin.
+        selected = next((_default_choice(v) for v in views if v.configured), "")
+    preset_word = "configured resin" if resin else "preset filament"
     groups, skipped = [], []
     for v in views:
         if not v.configured:
@@ -1345,7 +1406,7 @@ def _printer_select(views: list[PrinterView], default_printer: str) -> str:
         opts: list[tuple[str, str, str, bool, str]] = []  # value, label, colour, disabled, icon
         for m in _menu_order(v):
             if m is None:
-                opts.append((key, f"{name} · preset filament ({preset_label})", "", False, ""))
+                opts.append((key, f"{name} · {preset_word} ({preset_label})", "", False, ""))
                 continue
             label, disabled = _material_label(m, v.printer)
             icon = "" if m.raw.get("empty") else m.colour or ""  # an empty gate: no filament
@@ -1368,7 +1429,8 @@ def _printer_select(views: list[PrinterView], default_printer: str) -> str:
         else ""
     )
     return (
-        '<label>Printer and filament <select name="printer" class="fc" required>'
+        f"<label>Printer and {'resin' if resin else 'filament'} "
+        '<select name="printer" class="fc" required>'
         f"{SELECTED_BUTTON}{''.join(groups)}"
         f"</select></label>{note}"
     )
@@ -1397,13 +1459,14 @@ def _filament_choices(v: PrinterView) -> list[dict[str, Any]]:
     """The panel's filament menu for one printer (`_menu_order`)."""
     default = _split_printer(_default_choice(v))[1]
     preset_label = v.printer.profiles.filament.split(" @")[0]
+    preset_word = "Configured resin" if v.printer.technology == "sla" else "Preset filament"
     out: list[dict[str, Any]] = []
     for m in _menu_order(v):
         if m is None:
             out.append(
                 {
                     "value": "",
-                    "label": f"Preset filament ({preset_label})",
+                    "label": f"{preset_word} ({preset_label})",
                     "default": default is None,
                     "tool": False,
                     "profile": v.printer.profiles.filament,
@@ -1464,11 +1527,15 @@ def _panel_printer_selects(views: list[PrinterView], default_printer: str) -> st
     usable = [v for v in views if v.configured]
     skipped = [v.printer.name for v in views if not v.configured]
     first = next((v for v in usable if v.matches(default_printer)), usable[0] if usable else None)
+    # data-tech (absent: FDM): panel.js switches between the FDM and the resin settings by it.
     printers = "".join(
-        f'<option value="{_e(v.printer.key)}"{" selected" if v is first else ""}>'
+        f'<option value="{_e(v.printer.key)}"'
+        + ("" if v.printer.technology == "fdm" else f' data-tech="{_e(v.printer.technology)}"')
+        + f"{' selected' if v is first else ''}>"
         f"{_e(f'{v.printer.name} ({v.printer.model}), {v.state}')}</option>"
         for v in usable
     )
+    resin = first is not None and first.printer.technology == "sla"
     choices = {v.printer.key: _filament_choices(v) for v in usable}
     processes = {v.printer.key: _process_choices(v) for v in usable}
     machines = {v.printer.key: _machine_choices(v) for v in usable}
@@ -1501,11 +1568,12 @@ def _panel_printer_selects(views: list[PrinterView], default_printer: str) -> st
         f"<label{'' if machine_options else ' hidden'}>Printer profile "
         f'<select name="machine" data-choices="{_e(json.dumps(machines))}">'
         f"{machine_options}</select></label>"
-        f'<label>Filament <select name="filament" class="fc" '
+        f"<label>{'Resin' if resin else 'Filament'} "
+        '<select name="filament" class="fc" '
         f'data-choices="{_e(json.dumps(choices))}">{SELECTED_BUTTON}{filaments}</select></label>'
         '<label id="tool-slot" hidden>Load into <select name="filament_tool" class="fc">'
         f"{SELECTED_BUTTON}</select></label>"
-        f"<label{'' if process_options else ' hidden'}>Process "
+        f"<label{'' if process_options else ' hidden'}>{'Layer height' if resin else 'Process'} "
         f'<select name="process" data-choices="{_e(json.dumps(processes))}">'
         f"{process_options}</select></label>{note}"
     )

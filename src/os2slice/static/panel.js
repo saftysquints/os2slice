@@ -37,6 +37,24 @@
   let selectionOk = false;
   const mac = /Mac/.test(navigator.userAgent);
 
+  // A resin printer (the printer option's data-tech "sla") has one resin, a layer height,
+  // supports (none or auto) and copies. The FDM-only fields are hidden and disabled (so
+  // neither sent nor validated) while one is chosen; untouched supports and orientation
+  // take the technology's defaults.
+  const supports = form.elements.supports;
+  const FDM_ONLY = ["walls", "infill", "build_plate_only", "top_layers", "bottom_layers",
+    "brim", "plate"];
+  const moreSettings = form.querySelector("details.extras");
+  const FDM_SUPPORTS = supports ? [...supports.options].map((o) => [o.value, o.textContent]) : [];
+  const SLA_SUPPORTS = [["off", "None (on the build platform)"], ["normal", "Auto supports"]];
+  const DEFAULTS = {
+    fdm: { supports: supports ? supports.value : "", orient: "as-modeled" },
+    sla: { supports: "normal", orient: "auto" },
+  };
+  const touched = { supports: false, orient: false };
+  let tech = "fdm";
+  const resin = () => tech === "sla";
+
   let bodies = [];
   let faces = [];
   const chosen = {}; // extra part id -> tray id, kept across re-renders
@@ -144,6 +162,49 @@
 
   const printerName = () => printer.value;
   const nameOf = (id) => parts[id] || id;
+
+  // A label's own text, before its control: "Filament " / "Resin ".
+  function setLabelText(control, text) {
+    const label = control && control.closest("label");
+    if (label && label.firstChild && label.firstChild.nodeType === 3) {
+      label.firstChild.nodeValue = text;
+    }
+  }
+
+  // Switch the settings to the chosen printer's technology (FDM or resin).
+  function applyTech() {
+    const opt = printer.options[printer.selectedIndex];
+    const next = (opt && opt.dataset.tech) || "fdm";
+    if (next === tech) return;
+    tech = next;
+    const sla = resin();
+    for (const name of FDM_ONLY) {
+      const el = form.elements[name];
+      if (!el) continue;
+      el.disabled = sla;
+      el.closest("label").hidden = sla;
+    }
+    for (const el of form.querySelectorAll("[name^='x_']")) el.disabled = sla;
+    if (moreSettings) moreSettings.hidden = sla;
+    setLabelText(filament, sla ? "Resin " : "Filament ");
+    setLabelText(process, sla ? "Layer height " : "Process ");
+    if (supports) {
+      const keep = supports.value;
+      supports.replaceChildren(...(sla ? SLA_SUPPORTS : FDM_SUPPORTS).map(([value, label]) => {
+        const o = document.createElement("option");
+        o.value = value;
+        o.textContent = label;
+        return o;
+      }));
+      const offered = [...supports.options].some((o) => o.value === keep);
+      supports.value = touched.supports && offered ? keep : DEFAULTS[tech].supports;
+    }
+    if (!touched.orient && orient.value !== "face") orient.value = DEFAULTS[tech].orient;
+    // The desktop and browser slicer hand-offs open Bambu/Orca projects: FDM only.
+    for (const link of [studio, ...webApps.map((w) => w.link)]) {
+      if (link) link.closest("p").hidden = sla;
+    }
+  }
 
   // Refill the filament menu for the chosen printer: keep the choice if that printer
   // has it too (e.g. the preset), else take the printer's default (a loaded slot of the
@@ -267,6 +328,7 @@
 
   function renderExtras() {
     extrasBox.replaceChildren();
+    if (resin()) return; // every part prints in the one resin of the main menu
     const extra = bodies.slice(1);
     const options = slotOptions();
     for (const id of extra) {
@@ -315,6 +377,9 @@
   }
 
   function extraValue() {
+    if (resin()) {
+      return filament.value ? bodies.slice(1).map((id) => `${id}:${filament.value}`).join(",") : "";
+    }
     return bodies.slice(1).filter((id) => chosen[id])
       .map((id) => `${id}:${chosenTool[id] ? `${chosenTool[id]}.${chosen[id]}` : chosen[id]}`)
       .join(",");
@@ -329,7 +394,7 @@
     form.elements.extra.value = multi ? extraValue() : "";
     faceOpt.disabled = !face;
     if (face && orient.value !== "face" && !sync.userPicked) orient.value = "face";
-    if (!face && orient.value === "face") orient.value = "as-modeled";
+    if (!face && orient.value === "face") orient.value = DEFAULTS[tech].orient;
 
     let text;
     let ok = Boolean(part || face) && faces.length <= 1;
@@ -338,9 +403,10 @@
       text = `${bodies.length} parts as one print: ${bodies.map(nameOf).join(", ")}`;
       if (face) text += ", that face down";
       const everyPartHasSlot = filament.value !== ""
-        && bodies.slice(1).every((id) => chosen[id]);
+        && (resin() || bodies.slice(1).every((id) => chosen[id]));
       if (!everyPartHasSlot) {
-        text += ". Pick a loaded filament (not the preset) for every part.";
+        text += resin() ? ". Pick a resin from the list (not the configured one)."
+          : ". Pick a loaded filament (not the preset) for every part.";
         ok = false;
       }
     } else if (part && face) text = `${nameOf(part)}, that face down`;
@@ -427,7 +493,7 @@
     clearTimeout(linkTimer);
     studio.classList.add("off");
     studio.href = "#";
-    if (!enabled) return;
+    if (!enabled || resin()) return;
     linkTimer = setTimeout(async () => {
       if (linkFetch) linkFetch.abort();
       linkFetch = new AbortController();
@@ -455,15 +521,21 @@
     document.dispatchEvent(new CustomEvent("os2slice:color"));
   };
   printer.addEventListener("change", () => {
+    applyTech();
     renderMachines(); renderFilaments(); renderToolSlot(); renderProcesses(); renderExtras();
     syncColor(); sync();
   });
+  if (supports) supports.addEventListener("change", () => { touched.supports = true; });
   machine.addEventListener("change", () => {
     renderFilaments(); renderToolSlot(); renderExtras(); syncColor(); sync();
   });
   filament.addEventListener("change", () => { renderToolSlot(); syncColor(); sync(); });
   toolSlot.addEventListener("change", () => { slotPicked = toolSlot.value; sync(); });
-  orient.addEventListener("change", () => { sync.userPicked = true; sync(); });
+  orient.addEventListener("change", () => {
+    sync.userPicked = true;
+    touched.orient = true;
+    sync();
+  });
   // The Bambu Studio link carries the settings (copies, brim, ...): rebuild it on edits.
   const SETTINGS = ["walls", "infill", "supports", "build_plate_only", "top_layers",
     "bottom_layers", "brim", "copies", "plate", "process", "machine", "filament_tool"];
@@ -471,6 +543,7 @@
     const name = ev.target.name || "";
     if (SETTINGS.includes(name) || name.startsWith("x_")) scheduleStudioLink(selectionOk);
   });
+  applyTech();
   renderMachines();
   renderFilaments();
   renderToolSlot();

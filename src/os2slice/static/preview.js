@@ -147,7 +147,8 @@ function layout() {
   if (!base) return;
   const f = form.elements;
   const copies = copiesWanted();
-  const gap = LAYOUT.gap + (f.brim && f.brim.checked ? LAYOUT.brimGap : 0);
+  const brim = f.brim && f.brim.checked && !f.brim.disabled; // disabled: a resin printer
+  const gap = LAYOUT.gap + (brim ? LAYOUT.brimGap : 0);
   const offsets = copyOffsets([baseSize[0], baseSize[1]], copies, bedSize, gap);
   if (model) scene.remove(model);
   model = new THREE.Group();

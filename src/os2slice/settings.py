@@ -12,6 +12,12 @@ from os2slice.errors import BadRequest
 Supports = Literal["off", "normal", "tree"]
 SUPPORTS: tuple[Supports, ...] = ("off", "normal", "tree")
 SUPPORT_TYPE = {"normal": "normal(auto)", "tree": "tree(auto)"}
+# A resin printer's supports: none (the part sits on the build platform) or the slicer's own.
+SLA_SUPPORTS: tuple[tuple[Supports, str], ...] = (
+    ("off", "None (on the build platform)"),
+    ("normal", "Auto supports"),
+)
+SLA_DEFAULT_SUPPORTS: Supports = "normal"  # resin parts print tilted on supports
 
 # BamBuddy's canonical build plate names (SliceRequest.bed_type), docs/BAMBUDDY_API.md.
 BED_TYPES = (
@@ -108,7 +114,9 @@ class PrintSettings:
         """The panel's extra filament settings (one value, for every filament)."""
         return extra_settings.overrides(self.extras, "filament", bed_type)
 
-    def describe(self) -> str:
+    def describe(self, technology: str = "fdm") -> str:
+        if technology == "sla":
+            return self.describe_sla()
         sup = "no supports" if self.supports == "off" else f"{self.supports} supports"
         if self.supports != "off" and self.build_plate_only:
             sup += " (build plate only)"
@@ -120,6 +128,18 @@ class PrintSettings:
         if self.extras:
             text += f"; {extra_settings.describe(self.extras)}"
         return text
+
+    def describe_sla(self) -> str:
+        """The settings a resin printer uses: supports and copies."""
+        text = "no supports (on the build platform)" if self.supports == "off" else "auto supports"
+        if self.copies > 1:
+            text += f", {self.copies} copies"
+        return text
+
+    def for_sla(self) -> PrintSettings:
+        """Only what a resin printer uses (supports off or auto, copies); the rest default."""
+        supports: Supports = "off" if self.supports == "off" else SLA_DEFAULT_SUPPORTS
+        return PrintSettings(supports=supports, copies=self.copies)
 
     @classmethod
     def from_strings(cls, values: Mapping[str, str], defaults: PrintSettings) -> PrintSettings:
